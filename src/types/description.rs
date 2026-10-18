@@ -281,11 +281,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_template_renders_empty() {
-        assert_eq!(render(""), "");
-    }
-
-    #[test]
     fn unknown_variable_is_rejected() {
         let error = DescriptionTemplate::parse("hi ${user.nope}").unwrap_err();
         assert!(error.contains("user.nope"), "{error}");

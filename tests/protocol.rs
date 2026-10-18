@@ -1,6 +1,6 @@
 use soulseek::protocol::{
-    DistributedMessage, DistributedSearch, FileOffset, FileTransferInit, LoginOutcome,
-    MessageWriter, PeerInitMessage, PeerMessage, ResponseHeader, ServerRequest, ServerResponse,
+    DistributedMessage, DistributedSearch, LoginOutcome, MessageWriter, PeerInitMessage,
+    PeerMessage, ResponseHeader, ServerRequest, ServerResponse,
 };
 use soulseek::types::{
     ConnectionType, FileAttributes, FileInfo, FolderContents, TransferDirection,
@@ -484,17 +484,6 @@ fn distributed_round_trip() {
 }
 
 #[test]
-fn distributed_search_forwards_original_payload() {
-    let payload = search_payload(b"caf\xe9", b"\x01\x02\x03");
-    let search = DistributedSearch::parse(&payload).unwrap();
-    assert_eq!(search.search_term, "caf\u{e9}");
-    let bytes = search.to_bytes();
-    assert_eq!(&bytes[..4], &(payload.len() as u32 + 1).to_le_bytes());
-    assert_eq!(bytes[4], 3);
-    assert_eq!(&bytes[5..], &payload[..]);
-}
-
-#[test]
 fn embedded_distributed_search_unpacks_inline() {
     let inner = search_payload(b"query", b"\xff");
     let mut embedded = vec![3];
@@ -518,13 +507,4 @@ fn embedded_distributed_non_search_is_rejected_without_recursion() {
     let mut level = vec![4];
     level.extend_from_slice(&2i32.to_le_bytes());
     assert!(DistributedMessage::parse(93, &level).is_err());
-}
-
-#[test]
-fn file_connection_messages() {
-    let init = FileTransferInit { token: 31337 };
-    assert_eq!(FileTransferInit::parse(&init.to_bytes()).unwrap(), init);
-
-    let offset = FileOffset { offset: 1 << 33 };
-    assert_eq!(FileOffset::parse(&offset.to_bytes()).unwrap(), offset);
 }

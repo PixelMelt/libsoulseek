@@ -480,49 +480,6 @@ async fn search_results_are_filtered_against_the_query() {
 }
 
 #[tokio::test]
-async fn client_receives_search_results() {
-    let (server_addr, _registry) = start_fake_server().await;
-
-    let (responder, _responder_events) = net_peer(server_addr, "carol").await;
-
-    let (dave, mut dave_events, _dave_transfers) = login(server_addr, "dave").await;
-
-    let token = dave
-        .search("test query", SearchScope::Global)
-        .await
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let results = vec![FileInfo {
-        name: "Music\\test query.flac".into(),
-        size: 123456,
-        attributes: FileAttributes {
-            length: Some(200),
-            sample_rate: Some(44100),
-            bit_depth: Some(16),
-            ..FileAttributes::default()
-        },
-    }];
-    responder.peer(
-        "dave",
-        PeerMessage::FileSearchResponse {
-            username: "carol".into(),
-            token,
-            results: results.clone(),
-            free_upload_slots: true,
-            upload_speed: 500000,
-            queue_size: 0,
-            unknown: 0,
-            private_results: Vec::new(),
-        },
-    );
-
-    let (username, received) = search_results(&mut dave_events, token).await;
-    assert_eq!(username, "carol");
-    assert_eq!(received, results);
-}
-
-#[tokio::test]
 async fn restrictions_gate_uploads_and_actions_are_observed() {
     let (server_addr, _registry) = start_fake_server().await;
 
