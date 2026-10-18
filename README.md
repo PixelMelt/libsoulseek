@@ -2,7 +2,7 @@
 
 # libsoulseek
 
-Vibecoded Soulseek client library in Rust, split out of [newkitine](https://github.com/PixelMelt/newkitine).
+Vibecoded Soulseek client library in Rust.
 
 Very simple, probably unstable.
 

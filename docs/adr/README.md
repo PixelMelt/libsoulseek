@@ -6,7 +6,7 @@ Each record has a `Nicotine+` line stating whether the decision matches the orig
 
 To add one: next number, one decision per file, sections Context / Decision / Consequences, and mark anything it supersedes in both records.
 
-These records moved here from newkitine when the library was split out of it, and were renumbered. newkitine's index maps each old number to its record here; `newkitine ADR NNNN` names a record that stayed there.
+Records 0001 to 0028 began in newkitine and were renumbered here. newkitine's index maps each old number to its record here; `newkitine ADR NNNN` names a record that stayed there.
 
 | ADR | Title | Status | Nicotine+ |
 |---|---|---|---|
