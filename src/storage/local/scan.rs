@@ -1,19 +1,20 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::UNIX_EPOCH;
 
 use tracing::{info, warn};
 
-use crate::types::{FileAttributes, SharedFolder};
-
+use super::SharedFolder;
 use super::audio::{has_audio_extension, is_missing_vbr, read_attributes};
-use super::{ShareCatalog, ShareCatalogFile};
+use crate::storage::{CatalogFile, ScanProgress, ShareCatalog};
+use crate::types::FileAttributes;
 
 #[derive(Debug, thiserror::Error)]
-pub enum ScanError {
+pub(super) enum WalkError {
     #[error("cannot {action} {path}: {error}")]
     Io {
         action: &'static str,
@@ -22,17 +23,15 @@ pub enum ScanError {
     },
     #[error("duplicate virtual folder name {name}")]
     DuplicateVirtualName { name: String },
-    #[error("scan superseded by a newer scan")]
-    Superseded,
-    #[error("scan task panicked: {reason}")]
-    Panicked { reason: String },
+    #[error("scan cancelled")]
+    Cancelled,
 }
 
 fn io_error<P: Into<PathBuf>>(
     action: &'static str,
     path: impl FnOnce() -> P,
-) -> impl FnOnce(std::io::Error) -> ScanError {
-    move |error| ScanError::Io {
+) -> impl FnOnce(std::io::Error) -> WalkError {
+    move |error| WalkError::Io {
         action,
         path: path().into(),
         error,
@@ -43,12 +42,15 @@ const BACKSLASH_SENTINEL: &str = "@@BACKSLASH@@";
 const ATTRIBUTE_WORKER_CAP: usize = 12;
 const PROGRESS_INTERVAL: u64 = 1000;
 
-type AttributeCache<'a> = HashMap<&'a Path, HashMap<&'a OsStr, &'a ShareCatalogFile>>;
+type AttributeCache<'a> = HashMap<&'a [u8], HashMap<&'a [u8], &'a CatalogFile>>;
+
+pub(super) fn key_path(folder: &[u8], file: &[u8]) -> PathBuf {
+    Path::new(OsStr::from_bytes(folder)).join(OsStr::from_bytes(file))
+}
 
 struct Walk<'a> {
     share_filters: HashSet<&'a str>,
     cache: AttributeCache<'a>,
-    cancelled: &'a AtomicBool,
     progress: Progress<'a>,
     virtual_paths: HashSet<String>,
     catalog: ShareCatalog,
@@ -57,19 +59,19 @@ struct Walk<'a> {
 
 struct Progress<'a> {
     count: AtomicU64,
-    notify: &'a (dyn Fn(u64) + Sync),
+    scan: &'a ScanProgress,
 }
 
 impl Progress<'_> {
     fn add(&self) {
         let count = self.count.fetch_add(1, Ordering::Relaxed) + 1;
         if count.is_multiple_of(PROGRESS_INTERVAL) {
-            (self.notify)(count);
+            self.scan.files(count);
         }
     }
 }
 
-pub fn restrict(catalog: &ShareCatalog, shared_folders: &[SharedFolder]) -> ShareCatalog {
+pub(super) fn restrict(catalog: &ShareCatalog, shared_folders: &[SharedFolder]) -> ShareCatalog {
     let roots: Vec<(&str, PathBuf, bool)> = shared_folders
         .iter()
         .filter_map(|shared| {
@@ -78,65 +80,67 @@ pub fn restrict(catalog: &ShareCatalog, shared_folders: &[SharedFolder]) -> Shar
                 .map(|root| (shared.virtual_name.as_str(), root, shared.buddy_only))
         })
         .collect();
-    let mut restricted = ShareCatalog::empty();
-    for folder in &catalog.folders {
+    let mut restricted = ShareCatalog::new();
+    for folder in catalog.folders() {
         let root_name = folder
-            .virtual_path
+            .virtual_path()
             .split_once('\\')
-            .map_or(folder.virtual_path.as_ref(), |(root, _)| root);
+            .map_or(folder.virtual_path(), |(root, _)| root);
+        let real_path = Path::new(OsStr::from_bytes(folder.key()));
         let Some((_, _, buddy_only)) = roots
             .iter()
-            .find(|(name, root, _)| *name == root_name && folder.real_path.starts_with(root))
+            .find(|(name, root, _)| *name == root_name && real_path.starts_with(root))
         else {
             continue;
         };
-        restricted.push_folder(
-            folder.virtual_path.to_string(),
-            folder.real_path.clone(),
-            *buddy_only,
-            catalog.folder_files(folder).iter().cloned(),
-        );
+        restricted
+            .push_folder(
+                folder.virtual_path().to_owned(),
+                folder.key().to_vec(),
+                *buddy_only,
+                catalog.files(folder).to_vec(),
+            )
+            .expect("a restricted folder keeps its valid catalog entries");
     }
     restricted
 }
 
-pub fn walk(
+pub(super) fn walk(
     shared_folders: &[SharedFolder],
     share_filters: &[String],
-    cached: &ShareCatalog,
-    cancelled: &AtomicBool,
-    progress: &(dyn Fn(u64) + Sync),
-) -> Result<ShareCatalog, ScanError> {
+    previous: Option<&ShareCatalog>,
+    progress: &ScanProgress,
+) -> Result<ShareCatalog, WalkError> {
     let mut virtual_names = HashSet::new();
     for shared in shared_folders {
         if !virtual_names.insert(shared.virtual_name.as_str()) {
-            return Err(ScanError::DuplicateVirtualName {
+            return Err(WalkError::DuplicateVirtualName {
                 name: shared.virtual_name.clone(),
             });
         }
     }
-    let cache = cached
-        .folders
-        .iter()
-        .map(|folder| {
-            let files = cached
-                .folder_files(folder)
-                .iter()
-                .map(|file| (file.real_name.as_os_str(), file))
-                .collect();
-            (folder.real_path.as_path(), files)
+    let cache = previous
+        .into_iter()
+        .flat_map(|catalog| {
+            catalog.folders().iter().map(|folder| {
+                let files = catalog
+                    .files(folder)
+                    .iter()
+                    .map(|file| (file.key(), file))
+                    .collect();
+                (folder.key(), files)
+            })
         })
         .collect();
     let mut walk = Walk {
         share_filters: share_filters.iter().map(String::as_str).collect(),
         cache,
-        cancelled,
         progress: Progress {
             count: AtomicU64::new(0),
-            notify: progress,
+            scan: progress,
         },
         virtual_paths: HashSet::new(),
-        catalog: ShareCatalog::empty(),
+        catalog: ShareCatalog::new(),
         misses: Vec::new(),
     };
     for shared in shared_folders {
@@ -145,19 +149,19 @@ pub fn walk(
     let Walk {
         mut catalog,
         misses,
-        progress,
+        progress: counter,
         ..
     } = walk;
 
     let attribute_reads = misses.len();
-    read_missing_attributes(&mut catalog, misses, cancelled, &progress);
-    if cancelled.load(Ordering::Relaxed) {
-        return Err(ScanError::Superseded);
+    read_missing_attributes(&mut catalog, misses, &counter);
+    if progress.is_cancelled() {
+        return Err(WalkError::Cancelled);
     }
     info!(
-        folders = catalog.folders.len(),
-        files = catalog.files.len(),
-        cache_hits = catalog.files.len() - attribute_reads,
+        folders = catalog.folders().len(),
+        files = catalog.file_count(),
+        cache_hits = catalog.file_count() - attribute_reads,
         attribute_reads,
         "share scan complete"
     );
@@ -165,14 +169,14 @@ pub fn walk(
 }
 
 impl Walk<'_> {
-    fn root(&mut self, shared: &SharedFolder) -> Result<(), ScanError> {
+    fn root(&mut self, shared: &SharedFolder) -> Result<(), WalkError> {
         let root = fs::canonicalize(&shared.path)
             .map_err(io_error("resolve shared folder", || &shared.path))?;
         let mut visited = HashSet::new();
         let mut stack = vec![(root.clone(), root, shared.virtual_name.clone())];
         while let Some((real_dir, canonical_dir, virtual_dir)) = stack.pop() {
-            if self.cancelled.load(Ordering::Relaxed) {
-                return Err(ScanError::Superseded);
+            if self.progress.scan.is_cancelled() {
+                return Err(WalkError::Cancelled);
             }
             if visited.contains(&canonical_dir) {
                 warn!(path = %real_dir.display(), target = %canonical_dir.display(), "skipping folder already shared under this share");
@@ -184,7 +188,7 @@ impl Walk<'_> {
             }
             visited.insert(canonical_dir.clone());
             let entries = fs::read_dir(&real_dir).map_err(io_error("scan folder", || &real_dir))?;
-            let cached_files = self.cache.get(real_dir.as_path());
+            let cached_files = self.cache.get(real_dir.as_os_str().as_bytes());
             let mut names = HashSet::new();
             let mut files = Vec::new();
             for entry in entries {
@@ -238,14 +242,14 @@ impl Walk<'_> {
                     Some(FileAttributes::default())
                 } else {
                     cached_files
-                        .and_then(|files| files.get(real_name.as_os_str()))
+                        .and_then(|files| files.get(real_name.as_bytes()))
                         .filter(|cached| {
-                            cached.size == size
-                                && cached.mtime == mtime
-                                && cached.attributes != FileAttributes::default()
-                                && !is_missing_vbr(&cached.attributes)
+                            cached.size() == size
+                                && cached.modified() == mtime
+                                && *cached.attributes() != FileAttributes::default()
+                                && !is_missing_vbr(cached.attributes())
                         })
-                        .map(|cached| cached.attributes.clone())
+                        .map(|cached| cached.attributes().clone())
                 };
                 let known = attributes.is_some();
                 if known {
@@ -253,21 +257,27 @@ impl Walk<'_> {
                 }
                 let attributes = attributes.unwrap_or_default();
                 files.push((
-                    ShareCatalogFile::new(name, real_name, size, mtime, attributes),
+                    CatalogFile::new(name, real_name.into_vec(), size, mtime, attributes),
                     known,
                 ));
             }
-            files.sort_by(|(a, _), (b, _)| a.name.cmp(&b.name));
-            let first_index = self.catalog.files.len();
+            files.sort_by(|(a, _), (b, _)| a.name().cmp(b.name()));
+            let first_index = self.catalog.file_count();
             for (offset, (file, known)) in files.iter().enumerate() {
                 if !known {
-                    let path = real_dir.join(&file.real_name);
+                    let path = key_path(real_dir.as_os_str().as_bytes(), file.key());
                     self.misses.push(((first_index + offset) as u32, path));
                 }
             }
-            let files = files.into_iter().map(|(file, _)| file);
+            let files = files.into_iter().map(|(file, _)| file).collect();
             self.catalog
-                .push_folder(virtual_dir, real_dir, shared.buddy_only, files);
+                .push_folder(
+                    virtual_dir,
+                    real_dir.into_os_string().into_vec(),
+                    shared.buddy_only,
+                    files,
+                )
+                .expect("the walk produces valid catalog folders");
         }
         Ok(())
     }
@@ -276,7 +286,6 @@ impl Walk<'_> {
 fn read_missing_attributes(
     catalog: &mut ShareCatalog,
     misses: Vec<(u32, PathBuf)>,
-    cancelled: &AtomicBool,
     progress: &Progress,
 ) {
     if misses.is_empty() {
@@ -294,7 +303,7 @@ fn read_missing_attributes(
         for _ in 0..workers {
             let results = results.clone();
             scope.spawn(move || {
-                while !cancelled.load(Ordering::Relaxed) {
+                while !progress.scan.is_cancelled() {
                     let position = cursor.fetch_add(1, Ordering::Relaxed);
                     let Some((file_index, path)) = misses.get(position) else {
                         break;
@@ -307,7 +316,7 @@ fn read_missing_attributes(
         }
         drop(results);
         for (file_index, attributes) in received {
-            catalog.files[file_index as usize].attributes = attributes;
+            catalog.set_attributes(file_index, attributes);
         }
     });
 }
@@ -322,25 +331,32 @@ fn unix_mtime(metadata: &fs::Metadata) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
     use super::*;
-    use crate::client::shares::{SharesIndex, cache};
-    use crate::types::{DEFAULT_MAX_SEARCH_RESULTS, DEFAULT_MIN_SEARCH_CHARS, FileInfo};
+    use crate::storage::CatalogFolder;
+    use crate::storage::local::cache;
+
+    fn progress(cancelled: bool) -> ScanProgress {
+        ScanProgress::new(Arc::new(AtomicBool::new(cancelled)), |_| {})
+    }
 
     fn scan(
         shared_folders: &[SharedFolder],
         share_filters: &[String],
         cache_path: &Path,
-        cancelled: &AtomicBool,
-    ) -> Result<SharesIndex, ScanError> {
+        cancelled: bool,
+    ) -> Result<ShareCatalog, WalkError> {
+        let previous = cache::load(cache_path);
         let catalog = walk(
             shared_folders,
             share_filters,
-            &cache::load(cache_path),
-            cancelled,
-            &|_| {},
+            Some(&previous),
+            &progress(cancelled),
         )?;
         cache::save(cache_path, &catalog);
-        Ok(SharesIndex::from_catalog(catalog))
+        Ok(catalog)
     }
 
     fn music_share(path: PathBuf) -> Vec<SharedFolder> {
@@ -351,27 +367,32 @@ mod tests {
         }]
     }
 
-    fn scan_music(path: PathBuf, cache_path: &Path) -> SharesIndex {
-        scan(&music_share(path), &[], cache_path, &AtomicBool::new(false)).unwrap()
+    fn scan_music(path: PathBuf, cache_path: &Path) -> ShareCatalog {
+        scan(&music_share(path), &[], cache_path, false).unwrap()
     }
 
-    fn search(
-        index: &SharesIndex,
-        term: &str,
-        is_buddy: bool,
-        phrases: &[String],
-    ) -> Vec<FileInfo> {
-        index.search(
-            term,
-            is_buddy,
-            phrases,
-            DEFAULT_MAX_SEARCH_RESULTS,
-            DEFAULT_MIN_SEARCH_CHARS,
-        )
+    fn folder<'a>(catalog: &'a ShareCatalog, virtual_path: &str) -> Option<&'a CatalogFolder> {
+        catalog
+            .folders()
+            .iter()
+            .find(|folder| folder.virtual_path() == virtual_path)
     }
 
-    fn names(results: Vec<FileInfo>) -> Vec<String> {
-        results.into_iter().map(|file| file.name).collect()
+    fn lookup<'a>(
+        catalog: &'a ShareCatalog,
+        virtual_path: &str,
+    ) -> Option<(PathBuf, &'a CatalogFile)> {
+        let (directory, name) = virtual_path.rsplit_once('\\')?;
+        let folder = folder(catalog, directory)?;
+        let file = catalog
+            .files(folder)
+            .iter()
+            .find(|file| file.name() == name)?;
+        Some((key_path(folder.key(), file.key()), file))
+    }
+
+    fn counts(catalog: &ShareCatalog) -> (usize, usize) {
+        (catalog.folders().len(), catalog.file_count())
     }
 
     fn temp_base() -> PathBuf {
@@ -412,16 +433,16 @@ mod tests {
         let catalog = cache::load(cache_path);
         let real_dir = fs::canonicalize(real_dir).unwrap();
         let folder = catalog
-            .folders
+            .folders()
             .iter()
-            .find(|folder| folder.real_path == real_dir)
+            .find(|folder| folder.key() == real_dir.as_os_str().as_bytes())
             .expect("folder in cache");
         catalog
-            .folder_files(folder)
+            .files(folder)
             .iter()
-            .find(|file| file.real_name == name)
+            .find(|file| file.key() == name.as_bytes())
             .expect("file in cache")
-            .attributes
+            .attributes()
             .clone()
     }
 
@@ -436,19 +457,21 @@ mod tests {
             vbr,
             ..Default::default()
         };
-        let mut catalog = ShareCatalog::empty();
-        catalog.push_folder(
-            "Music".into(),
-            fs::canonicalize(&dir).unwrap(),
-            false,
-            [ShareCatalogFile::new(
-                name.into(),
-                name.into(),
-                300,
-                mtime,
-                attributes,
-            )],
-        );
+        let mut catalog = ShareCatalog::new();
+        catalog
+            .push_folder(
+                "Music".into(),
+                fs::canonicalize(&dir).unwrap().into_os_string().into_vec(),
+                false,
+                vec![CatalogFile::new(
+                    name.into(),
+                    name.as_bytes().to_vec(),
+                    300,
+                    mtime,
+                    attributes,
+                )],
+            )
+            .unwrap();
         let cache_path = cache_path(&base);
         cache::save(&cache_path, &catalog);
         (dir, cache_path)
@@ -476,53 +499,26 @@ mod tests {
         ]
     }
 
-    fn test_index() -> SharesIndex {
+    #[test]
+    fn shares_scan_into_virtual_folders_with_their_buddy_flags() {
         let base = temp_base();
-        scan(
-            &test_shares(&base),
-            &[],
-            &cache_path(&base),
-            &AtomicBool::new(false),
-        )
-        .expect("scan test shares")
+        let catalog = scan(&test_shares(&base), &[], &cache_path(&base), false).unwrap();
+
+        let (path, file) = lookup(&catalog, "Public\\Sample Album\\First Song.flac").unwrap();
+        assert_eq!(file.size(), 300);
+        assert!(path.ends_with("public/Sample Album/First Song.flac"));
+        assert!(
+            !folder(&catalog, "Public\\Sample Album")
+                .unwrap()
+                .buddy_only()
+        );
+        assert!(folder(&catalog, "Private").unwrap().buddy_only());
+        assert!(lookup(&catalog, "Private\\hidden song.wav").is_some());
+        assert_eq!(counts(&catalog), (3, 3));
     }
 
     #[test]
-    fn search_word_matching() {
-        let index = test_index();
-
-        let results = search(&index, "sample first", false, &[]);
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].name, "Public\\Sample Album\\First Song.flac");
-
-        assert!(search(&index, "sample missing", false, &[]).is_empty());
-
-        let excluded = search(&index, "sample -tune", false, &[]);
-        assert_eq!(excluded.len(), 1);
-        assert_eq!(excluded[0].name, "Public\\Sample Album\\First Song.flac");
-
-        let partial = search(&index, "sample *une", false, &[]);
-        assert_eq!(partial.len(), 1);
-        assert_eq!(partial[0].name, "Public\\Sample Album\\Second Tune.ogg");
-
-        assert_eq!(search(&index, "SAMPLE ALBUM", false, &[]).len(), 2);
-        assert!(search(&index, "ab", false, &[]).is_empty());
-    }
-
-    #[test]
-    fn search_respects_permissions_and_phrases() {
-        let index = test_index();
-
-        assert!(search(&index, "hidden song", false, &[]).is_empty());
-        let buddy = search(&index, "hidden song", true, &[]);
-        assert_eq!(buddy.len(), 1);
-        assert_eq!(buddy[0].name, "Private\\hidden song.wav");
-
-        assert!(search(&index, "first song", false, &["first".into()]).is_empty());
-    }
-
-    #[test]
-    fn case_colliding_paths_scan_and_resolve() {
+    fn case_colliding_paths_are_both_shared() {
         let base = temp_base();
         let lower = base.join("music/moe shop - pure");
         let upper = base.join("music/Moe Shop - Pure");
@@ -531,74 +527,15 @@ mod tests {
         fs::write(lower.join("Crush.mp3"), b"a".repeat(200)).unwrap();
         fs::write(upper.join("Crush.mp3"), b"b".repeat(300)).unwrap();
 
-        let index = scan_music(base.join("music"), &cache_path(&base));
+        let catalog = scan_music(base.join("music"), &cache_path(&base));
 
-        let (folders, files) = index.counts();
-        assert_eq!(folders, 3);
-        assert_eq!(files, 2);
-
-        let (path, size, _) = index
-            .resolve("Music\\Moe Shop - Pure\\Crush.mp3", false)
-            .expect("resolve exact case");
-        assert_eq!(size, 300);
+        assert_eq!(counts(&catalog), (3, 2));
+        let (path, file) = lookup(&catalog, "Music\\Moe Shop - Pure\\Crush.mp3").unwrap();
+        assert_eq!(file.size(), 300);
         assert!(path.starts_with(&upper));
-
-        let (path, size, _) = index
-            .resolve("Music\\moe shop - pure\\Crush.mp3", false)
-            .expect("resolve other exact case");
-        assert_eq!(size, 200);
+        let (path, file) = lookup(&catalog, "Music\\moe shop - pure\\Crush.mp3").unwrap();
+        assert_eq!(file.size(), 200);
         assert!(path.starts_with(&lower));
-
-        assert!(
-            index
-                .resolve("MUSIC\\MOE SHOP - PURE\\CRUSH.MP3", false)
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn browse_and_resolve() {
-        let index = test_index();
-
-        let public = index.browse(false);
-        assert!(
-            public
-                .iter()
-                .all(|folder| !folder.directory.starts_with("Private"))
-        );
-        let buddy = index.browse(true);
-        assert!(buddy.iter().any(|folder| folder.directory == "Private"));
-
-        let (path, size, _) = index
-            .resolve("public\\sample album\\FIRST SONG.FLAC", false)
-            .expect("case-insensitive resolve");
-        assert_eq!(size, 300);
-        assert!(path.ends_with("Sample Album/First Song.flac"));
-        assert!(index.resolve("Private\\hidden song.wav", false).is_none());
-        assert!(index.resolve("Private\\hidden song.wav", true).is_some());
-
-        assert_eq!(
-            index.folder_contents("Public\\Sample Album", false).len(),
-            1
-        );
-        assert!(index.folder_contents("Private", false).is_empty());
-        assert!(index.folder_contents("Nope", true).is_empty());
-    }
-
-    #[test]
-    fn streaming_browse_matches_peer_message_encoding() {
-        let index = test_index();
-        for is_buddy in [false, true] {
-            let expected = crate::protocol::PeerMessage::SharedFileListResponse {
-                shares: index.browse(is_buddy),
-                unknown: 0,
-                private_shares: Vec::new(),
-            };
-            let bytes = index.browse_frame(is_buddy);
-            assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 5);
-            let parsed = crate::protocol::PeerMessage::parse(5, &bytes[8..]).unwrap();
-            assert_eq!(parsed, expected);
-        }
     }
 
     #[test]
@@ -609,16 +546,12 @@ mod tests {
         write_wav(&dir.join("tone.wav"));
         let cache_path = cache_path(&base);
 
-        let index = scan_music(dir.clone(), &cache_path);
+        let catalog = scan_music(dir.clone(), &cache_path);
 
-        let (_, _, attributes) = index.resolve("Music\\tone.wav", false).unwrap();
+        let attributes = lookup(&catalog, "Music\\tone.wav").unwrap().1.attributes();
         assert_eq!(attributes.sample_rate, Some(44100));
         assert_eq!(attributes.bit_depth, Some(16));
         assert_eq!(attributes.length, Some(1));
-
-        let contents = index.folder_contents("Music", false);
-        assert_eq!(contents[0].files[0].attributes.sample_rate, Some(44100));
-
         assert_eq!(
             cached_attributes(&cache_path, &dir, "tone.wav").sample_rate,
             Some(44100)
@@ -629,9 +562,9 @@ mod tests {
     fn cache_hit_skips_reading_attributes() {
         let (dir, cache_path) = cached_song("song.flac", 0, Some(0));
 
-        let index = scan_music(dir, &cache_path);
+        let catalog = scan_music(dir, &cache_path);
 
-        let (_, _, attributes) = index.resolve("Music\\song.flac", false).unwrap();
+        let attributes = lookup(&catalog, "Music\\song.flac").unwrap().1.attributes();
         assert_eq!(attributes.bitrate, Some(320));
     }
 
@@ -639,9 +572,9 @@ mod tests {
     fn changed_file_invalidates_cache_entry() {
         let (dir, cache_path) = cached_song("song.flac", 1, None);
 
-        let index = scan_music(dir.clone(), &cache_path);
+        let catalog = scan_music(dir.clone(), &cache_path);
 
-        let (_, _, attributes) = index.resolve("Music\\song.flac", false).unwrap();
+        let attributes = lookup(&catalog, "Music\\song.flac").unwrap().1.attributes();
         assert_eq!(*attributes, FileAttributes::default());
         assert_eq!(
             cached_attributes(&cache_path, &dir, "song.flac"),
@@ -653,25 +586,19 @@ mod tests {
     fn restrict_applies_the_share_configuration_to_a_cached_catalog() {
         let base = temp_base();
         let shares = test_shares(&base);
-        let catalog = walk(
-            &shares,
-            &[],
-            &ShareCatalog::empty(),
-            &AtomicBool::new(false),
-            &|_| {},
-        )
-        .unwrap();
-        assert_eq!(catalog.folders.len(), 3);
+        let catalog = walk(&shares, &[], None, &progress(false)).unwrap();
+        assert_eq!(catalog.folders().len(), 3);
 
         let public_only = restrict(&catalog, &shares[..1]);
-        assert_eq!(public_only.folders.len(), 2);
+        assert_eq!(counts(&public_only), (2, 2));
         assert!(
             public_only
-                .folders
+                .folders()
                 .iter()
-                .all(|folder| folder.virtual_path.starts_with("Public"))
+                .all(|folder| folder.virtual_path().starts_with("Public"))
         );
-        assert_eq!(public_only.files.len(), 2);
+        assert!(lookup(&public_only, "Public\\Sample Album\\First Song.flac").is_some());
+        assert!(lookup(&public_only, "Private\\hidden song.wav").is_none());
 
         let flipped = restrict(
             &catalog,
@@ -681,7 +608,7 @@ mod tests {
                 buddy_only: true,
             }],
         );
-        assert!(flipped.folders.iter().all(|folder| folder.buddy_only));
+        assert!(flipped.folders().iter().all(CatalogFolder::buddy_only));
 
         let renamed = restrict(
             &catalog,
@@ -691,25 +618,19 @@ mod tests {
                 buddy_only: false,
             }],
         );
-        assert!(renamed.folders.is_empty());
-
-        let index = SharesIndex::from_catalog(public_only);
-        assert_eq!(index.counts(), (2, 2));
-        assert!(
-            index
-                .resolve("Public\\Sample Album\\First Song.flac", false)
-                .is_some()
-        );
-        assert!(index.resolve("Private\\hidden song.wav", true).is_none());
+        assert!(renamed.folders().is_empty());
     }
 
     #[test]
     fn progress_notifies_every_interval() {
-        let seen = std::sync::Mutex::new(Vec::new());
-        let notify = |count| seen.lock().unwrap().push(count);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let scan = ScanProgress::new(Arc::new(AtomicBool::new(false)), {
+            let seen = seen.clone();
+            move |count| seen.lock().unwrap().push(count)
+        });
         let progress = Progress {
             count: AtomicU64::new(0),
-            notify: &notify,
+            scan: &scan,
         };
         for _ in 0..(PROGRESS_INTERVAL * 2 + 1) {
             progress.add();
@@ -730,18 +651,16 @@ mod tests {
         fs::write(dir.join("Thumbs.db"), b"x").unwrap();
         fs::write(covers.join("front.mp3"), b"y".repeat(300)).unwrap();
 
-        let index = scan(
+        let catalog = scan(
             &music_share(dir),
             &["Thumbs.db".into(), "Covers".into()],
             &cache_path(&base),
-            &AtomicBool::new(false),
+            false,
         )
         .unwrap();
 
-        let (folders, files) = index.counts();
-        assert_eq!(folders, 1);
-        assert_eq!(files, 1);
-        assert!(index.resolve("Music\\song.mp3", false).is_some());
+        assert_eq!(counts(&catalog), (1, 1));
+        assert!(lookup(&catalog, "Music\\song.mp3").is_some());
     }
 
     #[test]
@@ -752,117 +671,34 @@ mod tests {
         fs::create_dir_all(&weird).unwrap();
         fs::write(weird.join("song.mp3"), b"g".repeat(300)).unwrap();
 
-        let index = scan_music(dir, &cache_path(&base));
+        let catalog = scan_music(dir, &cache_path(&base));
 
-        assert_eq!(
-            index.folder_contents("Music\\a@@BACKSLASH@@b", false).len(),
-            1
-        );
-        assert!(
-            index
-                .resolve("Music\\a@@BACKSLASH@@b\\song.mp3", false)
-                .is_some()
-        );
+        assert!(lookup(&catalog, "Music\\a@@BACKSLASH@@b\\song.mp3").is_some());
     }
 
     #[test]
-    fn cancelled_scan_is_superseded() {
+    fn cancelled_scan_stops() {
         let base = temp_base();
         let dir = base.join("music");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("song.mp3"), b"g".repeat(300)).unwrap();
 
-        let result = scan(
-            &music_share(dir),
-            &[],
-            &cache_path(&base),
-            &AtomicBool::new(true),
-        );
-        assert!(matches!(result, Err(ScanError::Superseded)));
-    }
-
-    #[test]
-    fn search_skips_trailing_empty_folder() {
-        let mut catalog = ShareCatalog::empty();
-        catalog.push_folder(
-            "Music".into(),
-            PathBuf::from("/music"),
-            false,
-            [ShareCatalogFile::new(
-                "song.flac".into(),
-                "song.flac".into(),
-                300,
-                0,
-                FileAttributes::default(),
-            )],
-        );
-        catalog.push_folder(
-            "Music\\Albums".into(),
-            PathBuf::from("/music/Albums"),
-            false,
-            [],
-        );
-        let index = SharesIndex::from_catalog(catalog);
-
-        assert_eq!(
-            names(search(&index, "music", false, &[])),
-            vec!["Music\\song.flac"]
-        );
-    }
-
-    #[test]
-    fn search_merges_folder_and_file_postings() {
-        let base = temp_base();
-        let dir = base.join("music/Sample");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("Sample.flac"), b"a".repeat(300)).unwrap();
-        fs::write(dir.join("Other.flac"), b"b".repeat(300)).unwrap();
-        fs::write(base.join("music/Sample Loose.mp3"), b"c".repeat(300)).unwrap();
-
-        let index = scan_music(base.join("music"), &cache_path(&base));
-
-        assert_eq!(
-            names(search(&index, "sample", false, &[])),
-            vec![
-                "Music\\Sample Loose.mp3",
-                "Music\\Sample\\Other.flac",
-                "Music\\Sample\\Sample.flac",
-            ]
-        );
-        assert_eq!(
-            names(search(&index, "sample other", false, &[])),
-            vec!["Music\\Sample\\Other.flac"]
-        );
-        assert_eq!(
-            names(search(&index, "sample -other", false, &[])),
-            vec!["Music\\Sample Loose.mp3", "Music\\Sample\\Sample.flac"]
-        );
-        assert_eq!(
-            names(search(&index, "sample *ose", false, &[])),
-            vec!["Music\\Sample Loose.mp3"]
-        );
-        assert_eq!(
-            names(search(&index, "sample", false, &["sample\\other".into()])),
-            vec!["Music\\Sample Loose.mp3", "Music\\Sample\\Sample.flac"]
-        );
-        assert_eq!(search(&index, "sample", false, &[]).len(), 3);
-        let capped = index.search("sample", false, &[], 2, 1);
-        assert_eq!(capped.len(), 2);
+        let result = scan(&music_share(dir), &[], &cache_path(&base), true);
+        assert!(matches!(result, Err(WalkError::Cancelled)));
     }
 
     #[test]
     fn cached_lossy_attributes_without_vbr_are_reread() {
         let (dir, cache_path) = cached_song("song.mp3", 0, None);
 
-        let index = scan_music(dir, &cache_path);
+        let catalog = scan_music(dir, &cache_path);
 
-        let (_, _, attributes) = index.resolve("Music\\song.mp3", false).unwrap();
+        let attributes = lookup(&catalog, "Music\\song.mp3").unwrap().1.attributes();
         assert_eq!(*attributes, FileAttributes::default());
     }
 
     #[test]
     fn lossy_equal_folder_names_are_skipped_not_fatal() {
-        use std::os::unix::ffi::OsStrExt;
         let base = temp_base();
         let music = base.join("music");
         for raw in [&b"album\xff"[..], &b"album\xfe"[..]] {
@@ -871,19 +707,14 @@ mod tests {
             fs::write(dir.join("track.flac"), b"t".repeat(10)).unwrap();
         }
 
-        let index = scan_music(music, &cache_path(&base));
+        let catalog = scan_music(music, &cache_path(&base));
 
-        assert_eq!(index.counts(), (2, 1));
-        assert!(
-            index
-                .resolve("Music\\album\u{fffd}\\track.flac", false)
-                .is_some()
-        );
+        assert_eq!(counts(&catalog), (2, 1));
+        assert!(lookup(&catalog, "Music\\album\u{fffd}\\track.flac").is_some());
     }
 
     #[test]
     fn lossy_equal_file_names_are_shared_once() {
-        use std::os::unix::ffi::OsStrExt;
         let base = temp_base();
         let music = base.join("music");
         fs::create_dir_all(&music).unwrap();
@@ -898,11 +729,9 @@ mod tests {
         )
         .unwrap();
 
-        let index = scan_music(music, &cache_path(&base));
+        let catalog = scan_music(music, &cache_path(&base));
 
-        assert_eq!(index.counts(), (1, 1));
-        let contents = index.folder_contents("Music", false);
-        assert_eq!(contents[0].files.len(), 1);
+        assert_eq!(counts(&catalog), (1, 1));
     }
 
     #[test]
@@ -920,21 +749,24 @@ mod tests {
         symlink(&music, music.join("real/loop")).unwrap();
         symlink(base.join("missing"), music.join("dangling")).unwrap();
 
-        let index = scan_music(music.clone(), &cache_path(&base));
+        let catalog = scan_music(music.clone(), &cache_path(&base));
 
-        let (path, size, _) = index
-            .resolve("Music\\linked dir\\linked.flac", false)
-            .unwrap();
-        assert_eq!(size, 30);
+        let (path, file) = lookup(&catalog, "Music\\linked dir\\linked.flac").unwrap();
+        assert_eq!(file.size(), 30);
         assert_eq!(
             path,
             fs::canonicalize(&music)
                 .unwrap()
                 .join("linked dir/linked.flac")
         );
-        let (_, size, _) = index.resolve("Music\\real\\single.flac", false).unwrap();
-        assert_eq!(size, 40);
-        assert!(index.folder_contents("Music\\real\\loop", false).is_empty());
-        assert_eq!(index.counts(), (3, 3));
+        assert_eq!(
+            lookup(&catalog, "Music\\real\\single.flac")
+                .unwrap()
+                .1
+                .size(),
+            40
+        );
+        assert!(folder(&catalog, "Music\\real\\loop").is_none());
+        assert_eq!(counts(&catalog), (3, 3));
     }
 }

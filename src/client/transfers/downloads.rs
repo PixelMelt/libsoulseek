@@ -1,28 +1,29 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::io;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use super::files;
 use super::registry::{Registry, TransferKey};
 use super::speed::SpeedMeter;
 use super::{
-    CONNECTION_CLOSED, CONNECTION_TIMEOUT, LOCAL_FILE_ERROR, TRANSFER_REQUEST_TIMEOUT, TransferIds,
-    TransferPhase, TransferRejectReason, USER_OFFLINE, VIRTUAL_PATH_LIMIT, peer_reason,
+    CONNECTION_CLOSED, CONNECTION_TIMEOUT, LOCAL_FILE_ERROR, StorageDone, StorageSender,
+    TRANSFER_REQUEST_TIMEOUT, TransferIds, TransferPhase, TransferRejectReason, USER_OFFLINE,
+    VIRTUAL_PATH_LIMIT, peer_reason, spawn_storage,
 };
 use crate::client::users::Users;
 use crate::client::{AbortResult, EnqueueResult, RetryResult, TransferWork};
-use crate::network::ConnId;
-use crate::network::{NetworkCommand, NetworkHandle};
+use crate::network::{ConnId, NetworkCommand, NetworkHandle, OpenDownload};
 use crate::protocol::PeerMessage;
+use crate::storage::{Download, DownloadRequest, DownloadStore};
 use crate::types::{
     FileAttributes, FileInfo, TransferDirection, TransferId, TransferSnapshot, TransferStatus,
 };
 
 const QUEUE_POSITION_INTERVAL: Duration = Duration::from_secs(300);
+const CHECK_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECTION_RETRY_INTERVAL: Duration = Duration::from_secs(180);
 const IO_RETRY_INTERVAL: Duration = Duration::from_secs(900);
 const MIN_LIMITED_BATCH: usize = 5;
@@ -92,12 +93,12 @@ fn due(at: &mut Instant, interval: Duration) -> bool {
     true
 }
 
-#[derive(Debug)]
 struct Transfer {
     id: TransferId,
     username: String,
     virtual_path: String,
-    folder_path: PathBuf,
+    destination: String,
+    store: Arc<dyn DownloadStore>,
     size: u64,
     attributes: FileAttributes,
     phase: TransferPhase,
@@ -107,7 +108,7 @@ struct Transfer {
     retry_attempt: bool,
     legacy_attempt: bool,
     size_changed: bool,
-    incomplete_path: Option<PathBuf>,
+    placement: u64,
     activated_at: Option<Instant>,
     speed: SpeedMeter,
 }
@@ -116,18 +117,18 @@ impl Transfer {
     fn new(
         id: TransferId,
         username: String,
-        virtual_path: String,
-        folder_path: PathBuf,
-        size: u64,
-        attributes: FileAttributes,
+        file: FileInfo,
+        destination: String,
+        store: Arc<dyn DownloadStore>,
     ) -> Self {
         Self {
             id,
             username,
-            virtual_path,
-            folder_path,
-            size,
-            attributes,
+            virtual_path: file.name,
+            destination,
+            store,
+            size: file.size,
+            attributes: file.attributes,
             phase: TransferPhase::Queued,
             bytes_done: 0,
             file_path: None,
@@ -135,9 +136,26 @@ impl Transfer {
             retry_attempt: false,
             legacy_attempt: false,
             size_changed: false,
-            incomplete_path: None,
+            placement: 0,
             activated_at: None,
             speed: SpeedMeter::default(),
+        }
+    }
+
+    fn download(&self) -> Download {
+        Download {
+            username: self.username.clone(),
+            virtual_path: self.virtual_path.clone(),
+            size: self.size,
+            destination: self.destination.clone(),
+        }
+    }
+
+    fn file(&self) -> FileInfo {
+        FileInfo {
+            name: self.virtual_path.clone(),
+            size: self.size,
+            attributes: self.attributes.clone(),
         }
     }
 
@@ -151,7 +169,7 @@ impl Transfer {
             direction: TransferDirection::Download,
             username: self.username.clone(),
             virtual_path: self.virtual_path.clone(),
-            folder_path: Some(self.folder_path.display().to_string()),
+            destination: Some(self.destination.clone()),
             size: self.size,
             bytes_done: self.bytes_done,
             status: self.phase.status(),
@@ -183,16 +201,26 @@ struct QueueLimit {
     held: VecDeque<TransferKey>,
 }
 
-pub(super) type PlacementDone = (TransferKey, std::io::Result<PathBuf>);
+type Discard = (Arc<dyn DownloadStore>, Download);
+
+pub(in crate::client) type CheckAnswer = (
+    Vec<TransferKey>,
+    u64,
+    Result<Vec<io::Result<Option<String>>>, String>,
+);
 
 pub(in crate::client) struct Downloads {
     net: NetworkHandle,
-    download_dir: PathBuf,
-    incomplete_dir: PathBuf,
-    username_subfolders: bool,
-    placements: mpsc::UnboundedSender<PlacementDone>,
+    store: Arc<dyn DownloadStore>,
+    storage: StorageSender,
     transfers: Registry<Transfer>,
-    basename_limits: HashMap<PathBuf, usize>,
+    epoch: u64,
+    checks: VecDeque<u64>,
+    answers: HashMap<u64, CheckAnswer>,
+    closing: HashMap<ConnId, TransferKey>,
+    placing: HashMap<u64, TransferKey>,
+    discards: HashMap<TransferKey, Vec<Discard>>,
+    seeded: Option<u64>,
     queue_limits: HashMap<String, QueueLimit>,
     recovery_queue: VecDeque<TransferKey>,
     recovery_pending: HashMap<TransferKey, RecoveryStep>,
@@ -201,22 +229,29 @@ pub(in crate::client) struct Downloads {
     io_retry_at: Instant,
 }
 
+fn discard(store: Arc<dyn DownloadStore>, download: Download) {
+    tokio::spawn(async move {
+        let (username, virtual_path) = (download.username.clone(), download.virtual_path.clone());
+        if let Err(error) = store.discard(download).await {
+            warn!(username, virtual_path, %error, "cannot discard a cleared download");
+        }
+    });
+}
+
 impl Downloads {
-    pub fn new(
-        net: NetworkHandle,
-        download_dir: PathBuf,
-        incomplete_dir: PathBuf,
-        username_subfolders: bool,
-        placements: mpsc::UnboundedSender<PlacementDone>,
-    ) -> Self {
+    pub fn new(net: NetworkHandle, store: Arc<dyn DownloadStore>, storage: StorageSender) -> Self {
         Self {
             net,
-            download_dir,
-            incomplete_dir,
-            username_subfolders,
-            placements,
+            store,
+            storage,
             transfers: Registry::default(),
-            basename_limits: HashMap::new(),
+            epoch: 0,
+            checks: VecDeque::new(),
+            answers: HashMap::new(),
+            closing: HashMap::new(),
+            placing: HashMap::new(),
+            discards: HashMap::new(),
+            seeded: None,
             queue_limits: HashMap::new(),
             recovery_queue: VecDeque::new(),
             recovery_pending: HashMap::new(),
@@ -226,56 +261,55 @@ impl Downloads {
         }
     }
 
-    fn basename_limit(&mut self, dir: &Path) -> usize {
-        if let Some(limit) = self.basename_limits.get(dir) {
-            return *limit;
-        }
-        let limit = files::basename_byte_limit(dir);
-        self.basename_limits.insert(dir.to_path_buf(), limit);
-        limit
+    pub fn set_store(&mut self, store: Arc<dyn DownloadStore>) {
+        self.store = store;
     }
 
-    fn destination(&self, username: &str, virtual_path: &str, root: Option<&str>) -> PathBuf {
-        files::folder_destination(
-            &self.download_dir,
-            self.username_subfolders,
+    fn destination(&self, username: &str, virtual_path: &str, root: Option<&str>) -> String {
+        self.store.destination(&DownloadRequest {
             username,
             virtual_path,
             root,
-        )
-    }
-
-    pub fn set_dirs(
-        &mut self,
-        download_dir: PathBuf,
-        incomplete_dir: PathBuf,
-        username_subfolders: bool,
-    ) {
-        self.download_dir = download_dir;
-        self.incomplete_dir = incomplete_dir;
-        self.username_subfolders = username_subfolders;
-        self.basename_limits.clear();
+        })
     }
 
     pub fn seed(&mut self, seed: TransferSnapshot) {
         let phase = TransferPhase::from_seed(&seed);
         let key = (seed.username.clone(), seed.virtual_path.clone());
-        let folder_path = seed.folder_path.map_or_else(
-            || self.destination(&seed.username, &seed.virtual_path, None),
-            PathBuf::from,
-        );
+        let destination = seed
+            .destination
+            .unwrap_or_else(|| self.destination(&seed.username, &seed.virtual_path, None));
+        let file = FileInfo {
+            name: seed.virtual_path,
+            size: seed.size,
+            attributes: seed.attributes,
+        };
         let mut transfer = Transfer::new(
             seed.id,
             seed.username,
-            seed.virtual_path,
-            folder_path,
-            seed.size,
-            seed.attributes,
+            file,
+            destination,
+            self.store.clone(),
         );
         transfer.phase = phase;
         transfer.bytes_done = seed.bytes_done;
         transfer.file_path = seed.file_path;
         self.transfers.insert(seed.id, key, transfer);
+    }
+
+    pub fn check_seeded(&mut self) {
+        let queued = self
+            .transfers
+            .keys_where(|transfer| transfer.phase == TransferPhase::Queued);
+        if queued.is_empty() {
+            return;
+        }
+        let epoch = self.next_epoch();
+        self.seeded = Some(epoch);
+        for key in &queued {
+            self.transfers.get_mut(key).unwrap().phase = TransferPhase::Checking(epoch);
+        }
+        self.check(self.store.clone(), epoch, queued);
     }
 
     pub fn enqueue(
@@ -292,11 +326,13 @@ impl Downloads {
         let Some(id) = self.admissible_id(ids, &username, &file.name) else {
             return (EnqueueResult::AlreadyActive, Vec::new());
         };
-        let folder_path = self.destination(&username, &file.name, root);
-        (
-            EnqueueResult::Enqueued,
-            self.queue(users, id, username, file, folder_path),
-        )
+        let store = self.store.clone();
+        let destination = self.destination(&username, &file.name, root);
+        let epoch = self.next_epoch();
+        users.watch(&username);
+        let (key, admitted) = self.admit(id, username, file, destination, store.clone(), epoch);
+        self.check(store, epoch, vec![key]);
+        (EnqueueResult::Enqueued, vec![admitted])
     }
 
     pub fn enqueue_folder(
@@ -307,8 +343,10 @@ impl Downloads {
         files: Vec<FileInfo>,
         root: &str,
     ) -> Vec<TransferWork> {
+        let store = self.store.clone();
+        let epoch = self.next_epoch();
         let mut work = Vec::with_capacity(files.len());
-        let mut requests = Vec::new();
+        let mut keys = Vec::new();
         for file in files {
             if file.name.len() > VIRTUAL_PATH_LIMIT {
                 warn!(username, "skipping a folder file whose path is too long");
@@ -317,23 +355,21 @@ impl Downloads {
             let Some(id) = self.admissible_id(ids, &username, &file.name) else {
                 continue;
             };
-            let folder_path = self.destination(&username, &file.name, Some(root));
-            let virtual_path = file.name.clone();
-            let admitted = self.admit(id, username.clone(), file, folder_path);
-            if matches!(admitted, TransferWork::Update(_)) {
-                requests.push(PeerMessage::QueueUpload {
-                    file: virtual_path,
-                    legacy_client: false,
-                });
-            }
+            let destination = self.destination(&username, &file.name, Some(root));
+            let (key, admitted) = self.admit(
+                id,
+                username.clone(),
+                file,
+                destination,
+                store.clone(),
+                epoch,
+            );
+            keys.push(key);
             work.push(admitted);
         }
-        if !requests.is_empty() {
+        if !keys.is_empty() {
             users.watch(&username);
-            self.net.send(NetworkCommand::SendPeerMessages {
-                username,
-                messages: requests,
-            });
+            self.check(store, epoch, keys);
         }
         work
     }
@@ -357,21 +393,9 @@ impl Downloads {
         }
     }
 
-    fn queue(
-        &mut self,
-        users: &mut Users,
-        id: TransferId,
-        username: String,
-        file: FileInfo,
-        folder_path: PathBuf,
-    ) -> Vec<TransferWork> {
-        let key = (username.clone(), file.name.clone());
-        let admitted = self.admit(id, username, file, folder_path);
-        if matches!(admitted, TransferWork::Update(_)) {
-            users.watch(&key.0);
-            self.send_queue_request(key);
-        }
-        vec![admitted]
+    fn next_epoch(&mut self) -> u64 {
+        self.epoch += 1;
+        self.epoch
     }
 
     fn admit(
@@ -379,57 +403,182 @@ impl Downloads {
         id: TransferId,
         username: String,
         file: FileInfo,
-        folder_path: PathBuf,
-    ) -> TransferWork {
+        destination: String,
+        store: Arc<dyn DownloadStore>,
+        epoch: u64,
+    ) -> (TransferKey, TransferWork) {
         let key = (username.clone(), file.name.clone());
         self.recovery_pending.remove(&key);
-        let limit = self.basename_limit(&folder_path);
-        let basename = files::download_basename(&file.name, limit);
-        let downloaded = files::complete_file_path(&folder_path, &basename, file.size);
-        let mut transfer = Transfer::new(
-            id,
-            username,
-            file.name,
-            folder_path,
-            file.size,
-            file.attributes,
-        );
-        let admitted = match downloaded {
-            Some(destination) => {
-                info!(
-                    username = key.0,
-                    virtual_path = key.1,
-                    ?destination,
-                    "file is already downloaded"
-                );
-                transfer.phase = TransferPhase::Finished;
-                transfer.bytes_done = transfer.size;
-                transfer.file_path = Some(destination.display().to_string());
-                TransferWork::Finished {
-                    snapshot: transfer.snapshot(),
-                    avg_speed_bps: None,
-                    delivered_bytes: 0,
-                }
-            }
-            None => TransferWork::Update(transfer.snapshot()),
-        };
-        self.transfers.insert(id, key, transfer);
-        admitted
+        self.discards.remove(&key);
+        let mut transfer = Transfer::new(id, username, file, destination, store);
+        transfer.phase = TransferPhase::Checking(epoch);
+        let admitted = TransferWork::Update(transfer.snapshot());
+        self.transfers.insert(id, key.clone(), transfer);
+        (key, admitted)
     }
 
-    fn requeue(&mut self, users: &mut Users, key: &TransferKey) -> Vec<TransferWork> {
-        let transfer = self.transfers.get(key).unwrap();
-        let (id, username, folder_path, file) = (
-            transfer.id,
-            transfer.username.clone(),
-            transfer.folder_path.clone(),
-            FileInfo {
-                name: transfer.virtual_path.clone(),
-                size: transfer.size,
-                attributes: transfer.attributes.clone(),
-            },
-        );
-        self.queue(users, id, username, file, folder_path)
+    fn check(&mut self, store: Arc<dyn DownloadStore>, epoch: u64, keys: Vec<TransferKey>) {
+        let downloads = keys
+            .iter()
+            .map(|key| self.transfers.get(key).unwrap().download())
+            .collect();
+        let sequence = self.next_epoch();
+        self.checks.push_back(sequence);
+        let existing = store.existing(downloads);
+        let bounded = Box::pin(async move { tokio::time::timeout(CHECK_TIMEOUT, existing).await });
+        spawn_storage(&self.storage, bounded, move |found| StorageDone::Checked {
+            sequence,
+            answer: (
+                keys,
+                epoch,
+                match found {
+                    Ok(Ok(results)) => Ok(results),
+                    Ok(Err(_)) => Err("the existence check timed out".to_owned()),
+                    Err(error) => Err(error),
+                },
+            ),
+        });
+    }
+
+    pub fn handle_checked(
+        &mut self,
+        logged_in: bool,
+        sequence: u64,
+        answer: CheckAnswer,
+    ) -> Vec<TransferWork> {
+        self.answers.insert(sequence, answer);
+        let mut work = Vec::new();
+        while let Some(next) = self.checks.front() {
+            let Some((keys, epoch, found)) = self.answers.remove(next) else {
+                break;
+            };
+            self.checks.pop_front();
+            work.extend(self.apply_check(logged_in, keys, epoch, found));
+        }
+        work
+    }
+
+    fn apply_check(
+        &mut self,
+        logged_in: bool,
+        keys: Vec<TransferKey>,
+        epoch: u64,
+        found: Result<Vec<io::Result<Option<String>>>, String>,
+    ) -> Vec<TransferWork> {
+        let count = keys.len();
+        let results = match found {
+            Ok(results) if results.len() == count => results,
+            Ok(results) => {
+                let error = format!(
+                    "download store answered {} of {count} existence checks",
+                    results.len()
+                );
+                (0..count)
+                    .map(|_| Err(io::Error::other(error.clone())))
+                    .collect()
+            }
+            Err(error) => (0..count)
+                .map(|_| Err(io::Error::other(error.clone())))
+                .collect(),
+        };
+        let seeded = self.seeded == Some(epoch);
+        let mut unchecked = 0;
+        let mut work = Vec::new();
+        let mut requests: Vec<(String, Vec<PeerMessage>)> = Vec::new();
+        for (key, result) in keys.into_iter().zip(results) {
+            let Some(transfer) = self.transfers.get_mut(&key) else {
+                continue;
+            };
+            if transfer.phase != TransferPhase::Checking(epoch) {
+                continue;
+            }
+            match result {
+                Ok(Some(location)) => {
+                    info!(
+                        username = key.0,
+                        virtual_path = key.1,
+                        location,
+                        "file is already downloaded"
+                    );
+                    transfer.phase = TransferPhase::Finished;
+                    transfer.bytes_done = transfer.size;
+                    transfer.file_path = Some(location);
+                    work.push(TransferWork::Finished {
+                        snapshot: transfer.snapshot(),
+                        avg_speed_bps: None,
+                        delivered_bytes: 0,
+                    });
+                }
+                Err(error) if seeded => {
+                    unchecked += 1;
+                    debug!(username = key.0, virtual_path = key.1, %error, "cannot check a restored download");
+                    transfer.phase = TransferPhase::Queued;
+                    let request = PeerMessage::QueueUpload {
+                        file: key.1,
+                        legacy_client: transfer.legacy_attempt,
+                    };
+                    match requests.iter_mut().find(|(username, _)| *username == key.0) {
+                        Some((_, messages)) => messages.push(request),
+                        None => requests.push((key.0, vec![request])),
+                    }
+                }
+                Ok(None) => {
+                    transfer.phase = TransferPhase::Queued;
+                    let request = PeerMessage::QueueUpload {
+                        file: key.1,
+                        legacy_client: transfer.legacy_attempt,
+                    };
+                    match requests.iter_mut().find(|(username, _)| *username == key.0) {
+                        Some((_, messages)) => messages.push(request),
+                        None => requests.push((key.0, vec![request])),
+                    }
+                }
+                Err(error) => work.extend(self.fail(&key, format!("{LOCAL_FILE_ERROR}: {error}"))),
+            }
+        }
+        if unchecked > 0 {
+            warn!(
+                unchecked,
+                "cannot check restored downloads for existing files, requesting them"
+            );
+        }
+        if logged_in {
+            for (username, messages) in requests {
+                self.net
+                    .send(NetworkCommand::SendPeerMessages { username, messages });
+            }
+        }
+        work
+    }
+
+    fn requeue(&mut self, users: &mut Users, keys: Vec<TransferKey>) -> Vec<TransferWork> {
+        let epoch = self.next_epoch();
+        let mut work = Vec::with_capacity(keys.len());
+        let mut checks: Vec<(Arc<dyn DownloadStore>, Vec<TransferKey>)> = Vec::new();
+        for key in keys {
+            let transfer = self.transfers.get(&key).unwrap();
+            let (id, username, file, destination, store) = (
+                transfer.id,
+                transfer.username.clone(),
+                transfer.file(),
+                transfer.destination.clone(),
+                transfer.store.clone(),
+            );
+            users.watch(&username);
+            let (key, admitted) = self.admit(id, username, file, destination, store.clone(), epoch);
+            work.push(admitted);
+            match checks
+                .iter_mut()
+                .find(|(checked, _)| Arc::ptr_eq(checked, &store))
+            {
+                Some((_, keys)) => keys.push(key),
+                None => checks.push((store, vec![key])),
+            }
+        }
+        for (store, keys) in checks {
+            self.check(store, epoch, keys);
+        }
+        work
     }
 
     pub fn retry(&mut self, users: &mut Users, id: TransferId) -> (RetryResult, Vec<TransferWork>) {
@@ -439,7 +588,7 @@ impl Downloads {
         if self.transfers.get(&key).unwrap().phase.is_active() {
             return (RetryResult::AlreadyActive, Vec::new());
         }
-        (RetryResult::Requeued, self.requeue(users, &key))
+        (RetryResult::Requeued, self.requeue(users, vec![key]))
     }
 
     pub fn needs_watch(&self, username: &str) -> bool {
@@ -463,21 +612,56 @@ impl Downloads {
     }
 
     pub fn clear(&mut self, statuses: Option<&[TransferStatus]>) -> Vec<TransferId> {
-        let removed: Vec<TransferId> = self
+        let removed: Vec<(TransferId, bool, Arc<dyn DownloadStore>, Download)> = self
             .transfers
             .values()
             .filter(|transfer| {
                 statuses.is_none_or(|statuses| statuses.contains(&transfer.phase.status()))
             })
-            .map(|transfer| transfer.id)
+            .map(|transfer| {
+                (
+                    transfer.id,
+                    transfer.phase == TransferPhase::Finished,
+                    transfer.store.clone(),
+                    transfer.download(),
+                )
+            })
             .collect();
-        for id in &removed {
-            let (_, detached) = self.transfers.remove(*id).unwrap();
+        let mut ids = Vec::with_capacity(removed.len());
+        for (id, finished, store, download) in removed {
+            let (key, detached) = self.transfers.remove(id).unwrap();
             if let Some(conn_id) = detached.conn_id {
                 self.net.send(NetworkCommand::CloseConnection(conn_id));
+                self.closing.insert(conn_id, key.clone());
+            }
+            ids.push(id);
+            if finished {
+                continue;
+            }
+            if self.in_flight(&key) {
+                self.discards
+                    .entry(key)
+                    .or_default()
+                    .push((store, download));
+            } else {
+                discard(store, download);
             }
         }
-        removed
+        ids
+    }
+
+    fn in_flight(&self, key: &TransferKey) -> bool {
+        self.closing.values().any(|closing| closing == key)
+            || self.placing.values().any(|placing| placing == key)
+    }
+
+    fn settle_discards(&mut self, key: &TransferKey) {
+        if self.in_flight(key) {
+            return;
+        }
+        for (store, download) in self.discards.remove(key).into_iter().flatten() {
+            discard(store, download);
+        }
     }
 
     pub fn start_session(&mut self, users: &mut Users) {
@@ -512,6 +696,7 @@ impl Downloads {
 
     pub fn drain_recovery(&mut self, users: &mut Users) -> Vec<TransferWork> {
         let mut updates = Vec::new();
+        let mut requeued = Vec::new();
         let mut handled = 0;
         while handled < RECOVERY_BATCH {
             let Some(key) = self.recovery_queue.pop_front() else {
@@ -525,15 +710,16 @@ impl Downloads {
             };
             match (step, &transfer.phase) {
                 (RecoveryStep::Request, TransferPhase::Queued) => self.send_queue_request(key),
-                (RecoveryStep::Request, phase) if resumes_online(phase) => {
-                    updates.extend(self.requeue(users, &key));
-                }
+                (RecoveryStep::Request, phase) if resumes_online(phase) => requeued.push(key),
                 (RecoveryStep::Park, phase) if parks_offline(phase) => {
                     updates.push(self.park_offline(&key));
                 }
                 _ => continue,
             }
             handled += 1;
+        }
+        if !requeued.is_empty() {
+            updates.extend(self.requeue(users, requeued));
         }
         updates
     }
@@ -623,7 +809,12 @@ impl Downloads {
         let busy: HashSet<&str> = self
             .transfers
             .values()
-            .filter(|transfer| transfer.phase == TransferPhase::Queued)
+            .filter(|transfer| {
+                matches!(
+                    transfer.phase,
+                    TransferPhase::Queued | TransferPhase::Checking(_)
+                )
+            })
             .map(|transfer| transfer.username.as_str())
             .chain(self.recovery_pending.keys().map(|key| key.0.as_str()))
             .collect();
@@ -696,7 +887,8 @@ impl Downloads {
                 if !token_taken
                     && matches!(
                         transfer.phase,
-                        TransferPhase::Queued
+                        TransferPhase::Checking(_)
+                            | TransferPhase::Queued
                             | TransferPhase::Limited
                             | TransferPhase::GettingStatus
                             | TransferPhase::Failed(_)
@@ -754,45 +946,34 @@ impl Downloads {
             return Vec::new();
         }
         self.transfers.attach_conn(&key, conn_id);
-        let incomplete_dir = self.incomplete_dir.clone();
-        let limit = self.basename_limit(&incomplete_dir);
-        let incomplete_path = files::incomplete_file_path(&incomplete_dir, username, &key.1, limit);
         let transfer = self.transfers.get_mut(&key).unwrap();
         transfer.activated_at = None;
-        transfer.incomplete_path = Some(incomplete_path.clone());
-
-        let size_changed = transfer.size_changed;
-        match files::open_incomplete(&incomplete_dir, &incomplete_path, size_changed) {
-            Ok((file, offset)) => {
-                transfer.retry_attempt = false;
-                if transfer.size > offset {
-                    transfer.phase = TransferPhase::Transferring;
-                    transfer.bytes_done = offset;
-                    transfer.queue_place = 0;
-                    transfer.speed.reset();
-                    let size = transfer.size;
-                    let started = TransferWork::Update(transfer.snapshot());
-                    info!(
-                        username,
-                        virtual_path = key.1,
-                        offset,
-                        size,
-                        "download started"
-                    );
-                    self.net.send(NetworkCommand::DownloadFile {
-                        conn_id,
-                        file,
-                        offset,
-                        bytes_left: size - offset,
-                    });
-                    vec![started]
-                } else {
-                    self.net.send(NetworkCommand::CloseConnection(conn_id));
-                    self.finish(&key)
-                }
-            }
-            Err(error) => self.fail(&key, format!("{LOCAL_FILE_ERROR}: {error}")),
-        }
+        transfer.retry_attempt = false;
+        transfer.phase = TransferPhase::Transferring;
+        transfer.queue_place = 0;
+        transfer.speed.reset();
+        let size = transfer.size;
+        let started = TransferWork::Update(transfer.snapshot());
+        info!(username, virtual_path = key.1, size, "download started");
+        let (store, download, restart) = (
+            transfer.store.clone(),
+            transfer.download(),
+            transfer.size_changed,
+        );
+        let open = OpenDownload::new(move || {
+            Box::pin(async move {
+                store
+                    .open(download, restart)
+                    .await
+                    .map(|opened| (opened.writer, opened.offset))
+            })
+        });
+        self.net.send(NetworkCommand::DownloadFile {
+            conn_id,
+            open,
+            size,
+        });
+        vec![started]
     }
 
     pub fn handle_download_progress(
@@ -820,6 +1001,9 @@ impl Downloads {
     }
 
     pub fn handle_file_connection_closed(&mut self, conn_id: ConnId) -> Vec<TransferWork> {
+        if let Some(key) = self.closing.remove(&conn_id) {
+            self.settle_discards(&key);
+        }
         let Some(key) = self.transfers.key_by_conn(conn_id).cloned() else {
             return Vec::new();
         };
@@ -894,7 +1078,10 @@ impl Downloads {
         };
         if matches!(
             transfer.phase,
-            TransferPhase::Placing | TransferPhase::Finished | TransferPhase::Aborted
+            TransferPhase::Checking(_)
+                | TransferPhase::Placing
+                | TransferPhase::Finished
+                | TransferPhase::Aborted
         ) || matches!(&transfer.phase, TransferPhase::Failed(reason) if is_local_reason(reason))
         {
             return Vec::new();
@@ -963,6 +1150,11 @@ impl Downloads {
         self.queue_limits.clear();
         self.recovery_queue.clear();
         self.recovery_pending.clear();
+        self.closing.clear();
+        let waiting: Vec<TransferKey> = self.discards.keys().cloned().collect();
+        for key in waiting {
+            self.settle_discards(&key);
+        }
         let active = self.transfers.keys_where(|transfer| {
             matches!(
                 transfer.phase,
@@ -979,50 +1171,44 @@ impl Downloads {
             transfer.size_changed = false;
             updates.push(TransferWork::Update(transfer.snapshot()));
         }
+        self.transfers.detach_conns();
         updates
     }
 
     fn finish(&mut self, key: &TransferKey) -> Vec<TransferWork> {
-        let transfer = self.transfers.get(key).unwrap();
-        let destination_dir = transfer.folder_path.clone();
-        let virtual_path = transfer.virtual_path.clone();
-        let limit = self.basename_limit(&destination_dir);
-        let basename = files::download_basename(&virtual_path, limit);
         self.transfers.detach_token(key);
+        let epoch = self.next_epoch();
+        self.placing.insert(epoch, key.clone());
         let transfer = self.transfers.get_mut(key).unwrap();
         transfer.phase = TransferPhase::Placing;
+        transfer.placement = epoch;
         transfer.bytes_done = transfer.size;
         let update = TransferWork::Update(transfer.snapshot());
-        let incomplete_path = transfer
-            .incomplete_path
-            .clone()
-            .expect("finishing a download that never opened its incomplete file");
-        let placements = self.placements.clone();
-        let key = key.clone();
-        let task = tokio::task::spawn_blocking(move || {
-            files::place_download(&destination_dir, &incomplete_path, &basename)
-        });
-        tokio::spawn(async move {
-            let result = match task.await {
-                Ok(result) => result,
-                Err(error) => Err(std::io::Error::other(format!(
-                    "placement task panicked: {error}"
-                ))),
-            };
-            let _ = placements.send((key, result));
-        });
+        let placing = key.clone();
+        spawn_storage(
+            &self.storage,
+            transfer.store.finish(transfer.download()),
+            move |result| StorageDone::Placed {
+                key: placing,
+                epoch,
+                result: result.unwrap_or_else(|error| Err(io::Error::other(error))),
+            },
+        );
         vec![update]
     }
 
     pub fn handle_placement_done(
         &mut self,
         key: &TransferKey,
-        result: std::io::Result<PathBuf>,
+        epoch: u64,
+        result: io::Result<String>,
     ) -> Vec<TransferWork> {
+        self.placing.remove(&epoch);
+        self.settle_discards(key);
         let Some(transfer) = self.transfers.get(key) else {
             return Vec::new();
         };
-        if transfer.phase != TransferPhase::Placing {
+        if transfer.phase != TransferPhase::Placing || transfer.placement != epoch {
             debug!(
                 username = key.0,
                 virtual_path = key.1,
@@ -1032,16 +1218,16 @@ impl Downloads {
             return Vec::new();
         }
         match result {
-            Ok(destination) => {
+            Ok(location) => {
                 let transfer = self.transfers.get_mut(key).unwrap();
                 transfer.phase = TransferPhase::Finished;
-                transfer.file_path = Some(destination.display().to_string());
                 info!(
                     username = key.0,
                     virtual_path = key.1,
-                    ?destination,
+                    location,
                     "download finished"
                 );
+                transfer.file_path = Some(location);
                 vec![TransferWork::Finished {
                     snapshot: transfer.snapshot(),
                     avg_speed_bps: None,
@@ -1055,6 +1241,7 @@ impl Downloads {
     fn release(&mut self, key: &TransferKey) {
         if let Some(conn_id) = self.transfers.detach(key).conn_id {
             self.net.send(NetworkCommand::CloseConnection(conn_id));
+            self.closing.insert(conn_id, key.clone());
         }
     }
 
@@ -1074,14 +1261,21 @@ impl Downloads {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use tokio::sync::mpsc;
+
     use super::*;
     use crate::protocol::ServerRequest;
+    use crate::storage::LocalDownloads;
 
     struct Harness {
         downloads: Downloads,
         commands: mpsc::Receiver<NetworkCommand>,
+        storage: mpsc::UnboundedReceiver<StorageDone>,
         ids: TransferIds,
         users: Users,
+        logged_in: bool,
         dir: PathBuf,
     }
 
@@ -1089,33 +1283,81 @@ mod tests {
         Users::new(HashSet::new(), HashSet::new(), HashSet::new(), Vec::new())
     }
 
+    fn local_store(dir: &std::path::Path, username_subfolders: bool) -> Arc<dyn DownloadStore> {
+        Arc::new(
+            LocalDownloads::new(
+                dir.join("complete"),
+                dir.join("incomplete"),
+                username_subfolders,
+            )
+            .unwrap(),
+        )
+    }
+
     impl Harness {
         fn new(name: &str) -> Self {
             let dir = std::env::temp_dir().join(format!("soulseek-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             let (net, commands) = crate::network::test_channel();
+            let (storage_tx, storage) = mpsc::unbounded_channel();
             Self {
-                downloads: Downloads::new(
-                    net,
-                    dir.join("complete"),
-                    dir.join("incomplete"),
-                    false,
-                    mpsc::unbounded_channel().0,
-                ),
+                downloads: Downloads::new(net, local_store(&dir, false), storage_tx),
                 commands,
+                storage,
                 ids: TransferIds::new(&[]),
                 users: no_users(),
+                logged_in: true,
                 dir,
             }
         }
 
-        fn enqueue(
+        async fn next_done(&mut self) -> StorageDone {
+            tokio::time::timeout(Duration::from_secs(10), self.storage.recv())
+                .await
+                .expect("a storage completion")
+                .expect("the storage channel stays open")
+        }
+
+        async fn route(&mut self, done: StorageDone) -> Vec<TransferWork> {
+            match done {
+                StorageDone::Checked { sequence, answer } => {
+                    self.downloads
+                        .handle_checked(self.logged_in, sequence, answer)
+                }
+                StorageDone::Placed { key, epoch, result } => {
+                    self.downloads.handle_placement_done(&key, epoch, result)
+                }
+                StorageDone::Sized { .. } => unreachable!("downloads never size files"),
+            }
+        }
+
+        async fn settle(&mut self) -> Vec<TransferWork> {
+            let mut work = Vec::new();
+            while self
+                .downloads
+                .transfers
+                .values()
+                .any(|transfer| matches!(transfer.phase, TransferPhase::Checking(_)))
+            {
+                let done = self.next_done().await;
+                work.extend(self.route(done).await);
+            }
+            work
+        }
+
+        async fn placed(&mut self) -> Vec<TransferWork> {
+            let done = self.next_done().await;
+            assert!(matches!(done, StorageDone::Placed { .. }));
+            self.route(done).await
+        }
+
+        async fn enqueue(
             &mut self,
             username: &str,
             file: &str,
             root: Option<&str>,
         ) -> (EnqueueResult, Vec<TransferWork>) {
-            self.downloads.enqueue(
+            let (result, mut work) = self.downloads.enqueue(
                 &mut self.ids,
                 &mut self.users,
                 username.into(),
@@ -1125,19 +1367,21 @@ mod tests {
                     attributes: FileAttributes::default(),
                 },
                 root,
-            )
+            );
+            work.extend(self.settle().await);
+            (result, work)
         }
 
-        fn queue_from(&mut self, username: &str, file: &str) -> TransferKey {
+        async fn queue_from(&mut self, username: &str, file: &str) -> TransferKey {
             assert_eq!(
-                self.enqueue(username, file, None).0,
+                self.enqueue(username, file, None).await.0,
                 EnqueueResult::Enqueued
             );
             (username.into(), file.into())
         }
 
-        fn queue(&mut self, file: &str) -> TransferKey {
-            self.queue_from("uploader", file)
+        async fn queue(&mut self, file: &str) -> TransferKey {
+            self.queue_from("uploader", file).await
         }
 
         fn request(&mut self, file: &str, token: u32, size: u64) -> Vec<TransferWork> {
@@ -1182,8 +1426,10 @@ mod tests {
             )
         }
 
-        fn recover(&mut self) -> Vec<TransferWork> {
-            self.downloads.drain_recovery(&mut self.users)
+        async fn recover(&mut self) -> Vec<TransferWork> {
+            let mut work = self.downloads.drain_recovery(&mut self.users);
+            work.extend(self.settle().await);
+            work
         }
 
         fn send_watches(&mut self) {
@@ -1254,11 +1500,13 @@ mod tests {
     fn queue_uploads(commands: &[NetworkCommand]) -> Vec<&str> {
         commands
             .iter()
-            .filter_map(|command| match command {
-                NetworkCommand::SendPeerMessage {
-                    message: PeerMessage::QueueUpload { file, .. },
-                    ..
-                } => Some(file.as_str()),
+            .flat_map(|command| match command {
+                NetworkCommand::SendPeerMessage { message, .. } => std::slice::from_ref(message),
+                NetworkCommand::SendPeerMessages { messages, .. } => messages.as_slice(),
+                _ => &[],
+            })
+            .filter_map(|message| match message {
+                PeerMessage::QueueUpload { file, .. } => Some(file.as_str()),
                 _ => None,
             })
             .collect()
@@ -1267,40 +1515,49 @@ mod tests {
     #[tokio::test]
     async fn folder_downloads_keep_the_remote_hierarchy() {
         let mut harness = Harness::new("hierarchy");
-        harness
-            .downloads
-            .set_dirs("/downloads".into(), "/incomplete".into(), true);
+        harness.downloads.set_store(Arc::new(
+            LocalDownloads::new("/downloads".into(), "/incomplete".into(), true).unwrap(),
+        ));
         let file = "share\\Soulseek\\folder1\\sub1\\file4.mp3";
-        let (result, _) = harness.enqueue("uploader", file, Some("share\\Soulseek"));
+        let (result, _) = harness
+            .enqueue("uploader", file, Some("share\\Soulseek"))
+            .await;
         assert_eq!(result, EnqueueResult::Enqueued);
         assert_eq!(
             harness
                 .transfer(&("uploader".into(), file.into()))
-                .folder_path,
-            PathBuf::from("/downloads/uploader/Soulseek/folder1/sub1")
+                .destination,
+            "/downloads/uploader/Soulseek/folder1/sub1"
         );
     }
 
-    fn enqueue_beside_existing(name: &str, existing_len: usize) -> (Harness, Vec<TransferWork>) {
+    async fn enqueue_beside_existing(
+        name: &str,
+        existing_len: usize,
+    ) -> (Harness, Vec<TransferWork>) {
         let mut harness = Harness::new(name);
         let destination = harness.dir.join("complete/Album");
         std::fs::create_dir_all(&destination).unwrap();
         std::fs::write(destination.join("song.mp3"), vec![0u8; existing_len]).unwrap();
-        let (result, work) =
-            harness.enqueue("uploader", "share\\Album\\song.mp3", Some("share\\Album"));
+        let (result, work) = harness
+            .enqueue("uploader", "share\\Album\\song.mp3", Some("share\\Album"))
+            .await;
         assert_eq!(result, EnqueueResult::Enqueued);
         (harness, work)
     }
 
     #[tokio::test]
     async fn an_already_downloaded_file_finishes_without_asking_the_peer() {
-        let (mut harness, work) = enqueue_beside_existing("skip", 100);
+        let (mut harness, work) = enqueue_beside_existing("skip", 100).await;
         assert!(matches!(
             work.as_slice(),
-            [TransferWork::Finished {
-                delivered_bytes: 0,
-                ..
-            }]
+            [
+                TransferWork::Update(_),
+                TransferWork::Finished {
+                    delivered_bytes: 0,
+                    ..
+                }
+            ]
         ));
         let key = ("uploader".to_owned(), "share\\Album\\song.mp3".to_owned());
         let transfer = harness.transfer(&key);
@@ -1314,14 +1571,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_size_mismatch_still_downloads() {
-        let (_harness, work) = enqueue_beside_existing("mismatch", 64);
+        let (_harness, work) = enqueue_beside_existing("mismatch", 64).await;
         assert!(matches!(work.as_slice(), [TransferWork::Update(_)]));
     }
 
     #[tokio::test]
     async fn late_denial_does_not_revive_aborted_transfer() {
         let mut harness = Harness::new("late-denial");
-        let key = harness.queue("Music\\song.mp3");
+        let key = harness.queue("Music\\song.mp3").await;
         let id = harness.transfer(&key).id;
         let (aborted, _) = harness.downloads.abort(id);
         assert_eq!(aborted, AbortResult::Aborted);
@@ -1335,8 +1592,8 @@ mod tests {
     #[tokio::test]
     async fn a_token_held_by_another_download_is_refused() {
         let mut harness = Harness::new("token-reuse");
-        let first = harness.queue("Music\\a.mp3");
-        let second = harness.queue("Music\\b.mp3");
+        let first = harness.queue("Music\\a.mp3").await;
+        let second = harness.queue("Music\\b.mp3").await;
         harness.start("Music\\a.mp3", 7, 1);
         harness.drain();
 
@@ -1362,7 +1619,7 @@ mod tests {
     #[tokio::test]
     async fn progress_from_a_superseded_connection_is_ignored() {
         let mut harness = Harness::new("stale-conn");
-        let key = harness.queue("Music\\a.mp3");
+        let key = harness.queue("Music\\a.mp3").await;
         harness.start("Music\\a.mp3", 7, 1);
         let work = harness
             .downloads
@@ -1381,7 +1638,7 @@ mod tests {
     #[tokio::test]
     async fn failing_a_transferring_download_closes_its_connection() {
         let mut harness = Harness::new("fail-close");
-        let key = harness.queue("Music\\a.mp3");
+        let key = harness.queue("Music\\a.mp3").await;
         harness.start("Music\\a.mp3", 7, 1);
         harness.drain();
 
@@ -1398,7 +1655,7 @@ mod tests {
     #[tokio::test]
     async fn denials_and_connection_errors_only_touch_queued_downloads() {
         let mut harness = Harness::new("queued-only");
-        let key = harness.queue("Music\\a.mp3");
+        let key = harness.queue("Music\\a.mp3").await;
         let requested = harness.request("Music\\a.mp3", 7, 100);
         assert_eq!(statuses(&requested), vec![TransferStatus::Queued]);
 
@@ -1423,14 +1680,14 @@ mod tests {
     #[tokio::test]
     async fn a_denial_reason_from_a_peer_is_bounded_and_cannot_name_an_internal_status() {
         let mut harness = Harness::new("denial-reason");
-        let long = harness.queue("Music\\a.mp3");
+        let long = harness.queue("Music\\a.mp3").await;
         let _ = harness.deny(&long, &"x".repeat(100_000));
         let TransferPhase::Failed(reason) = harness.phase(&long) else {
             panic!("expected a failed download");
         };
         assert_eq!(reason.len(), 255);
 
-        let spoofed = harness.queue("Music\\b.mp3");
+        let spoofed = harness.queue("Music\\b.mp3").await;
         let _ = harness.deny(&spoofed, CONNECTION_TIMEOUT);
         assert_eq!(
             harness.phase(&spoofed),
@@ -1441,7 +1698,7 @@ mod tests {
     #[tokio::test]
     async fn aborting_a_download_that_waits_to_retry_stops_the_retry() {
         let mut harness = Harness::new("abort-waiting");
-        let key = harness.queue("Music\\a.mp3");
+        let key = harness.queue("Music\\a.mp3").await;
         let _ = harness.fail_connection(&key, false);
         assert_eq!(harness.phase(&key), failed(CONNECTION_TIMEOUT));
         let id = harness.transfer(&key).id;
@@ -1449,14 +1706,16 @@ mod tests {
         assert_eq!(result, AbortResult::Aborted);
         assert_eq!(statuses(&work), vec![TransferStatus::Aborted]);
         harness.downloads.user_online("uploader");
-        assert!(harness.recover().is_empty());
+        assert!(harness.recover().await.is_empty());
         assert_eq!(harness.phase(&key), TransferPhase::Aborted);
     }
 
     #[tokio::test]
     async fn an_overlong_virtual_path_is_refused() {
         let mut harness = Harness::new("long-path");
-        let (result, work) = harness.enqueue("uploader", &"a".repeat(VIRTUAL_PATH_LIMIT + 1), None);
+        let (result, work) = harness
+            .enqueue("uploader", &"a".repeat(VIRTUAL_PATH_LIMIT + 1), None)
+            .await;
         assert_eq!(result, EnqueueResult::PathTooLong);
         assert!(work.is_empty());
     }
@@ -1464,8 +1723,8 @@ mod tests {
     #[tokio::test]
     async fn limited_downloads_stay_held_until_rejected_or_disconnected() {
         let mut harness = Harness::new("limited-denials");
-        let rejected = harness.queue("Music\\a.mp3");
-        let dropped = harness.queue("Music\\b.mp3");
+        let rejected = harness.queue("Music\\a.mp3").await;
+        let dropped = harness.queue("Music\\b.mp3").await;
         for key in [&rejected, &dropped] {
             let held = harness.deny(key, TransferRejectReason::TOO_MANY_FILES);
             assert_eq!(statuses(&held), vec![TransferStatus::Queued]);
@@ -1488,12 +1747,12 @@ mod tests {
     #[tokio::test]
     async fn every_requeue_is_published() {
         let mut harness = Harness::new("requeue-updates");
-        let key = harness.queue("Music\\a.mp3");
+        let key = harness.queue("Music\\a.mp3").await;
         let work = harness.fail_connection(&key, true);
         assert_eq!(statuses(&work), vec![TransferStatus::Failed]);
 
         harness.downloads.user_online("uploader");
-        let requeued = harness.recover();
+        let requeued = harness.recover().await;
         assert_eq!(statuses(&requeued), vec![TransferStatus::Queued]);
 
         let work = harness.deny(&key, TransferRejectReason::CANCELLED);
@@ -1506,7 +1765,7 @@ mod tests {
     #[tokio::test]
     async fn aborting_a_session_clears_size_changed_and_starting_clears_retry() {
         let mut harness = Harness::new("flag-resets");
-        let key = harness.queue("Music\\a.mp3");
+        let key = harness.queue("Music\\a.mp3").await;
         let _ = harness.request("Music\\a.mp3", 7, 250);
         assert!(harness.transfer(&key).size_changed);
         let _ = harness
@@ -1552,6 +1811,7 @@ mod tests {
             "share\\Album",
         );
         assert_eq!(work.len(), 900);
+        assert!(harness.settle().await.is_empty());
         let commands = harness.drain();
         assert!(matches!(
             commands.as_slice(),
@@ -1565,7 +1825,7 @@ mod tests {
     async fn a_folder_enqueue_watches_the_uploader_once() {
         let mut harness = Harness::new("watch-once");
         for index in 0..20 {
-            harness.queue(&format!("Music\\{index}.mp3"));
+            harness.queue(&format!("Music\\{index}.mp3")).await;
         }
         assert!(server_requests(&harness.drain()).is_empty());
         harness.send_watches();
@@ -1578,15 +1838,15 @@ mod tests {
     #[tokio::test]
     async fn offline_uploader_parks_pending_downloads_and_resumes_them_on_return() {
         let mut harness = Harness::new("offline-park");
-        let queued = harness.queue("a\\1.mp3");
-        let dropped = harness.queue("a\\2.mp3");
-        let denied = harness.queue("a\\3.mp3");
+        let queued = harness.queue("a\\1.mp3").await;
+        let dropped = harness.queue("a\\2.mp3").await;
+        let denied = harness.queue("a\\3.mp3").await;
         let _ = harness.fail_connection(&dropped, false);
         let _ = harness.deny(&denied, TransferRejectReason::CANCELLED);
         harness.drain();
 
         harness.downloads.user_offline("uploader");
-        let updates = harness.recover();
+        let updates = harness.recover().await;
         assert_eq!(updates.len(), 2);
         assert_eq!(harness.phase(&queued), failed(USER_OFFLINE));
         assert_eq!(harness.phase(&dropped), failed(USER_OFFLINE));
@@ -1597,7 +1857,7 @@ mod tests {
 
         harness.downloads.user_online("uploader");
         assert!(queue_uploads(&harness.drain()).is_empty());
-        let updates = harness.recover();
+        let updates = harness.recover().await;
         assert_eq!(
             statuses(&updates),
             vec![TransferStatus::Queued, TransferStatus::Queued]
@@ -1613,10 +1873,13 @@ mod tests {
     #[tokio::test]
     async fn parking_a_requested_download_forgets_its_token() {
         let mut harness = Harness::new("park-token");
-        let key = harness.queue("a\\1.mp3");
+        let key = harness.queue("a\\1.mp3").await;
         let _ = harness.request(&key.1, 7, 100);
         harness.downloads.user_offline("uploader");
-        assert_eq!(statuses(&harness.recover()), vec![TransferStatus::Failed]);
+        assert_eq!(
+            statuses(&harness.recover().await),
+            vec![TransferStatus::Failed]
+        );
         let downloads = &mut harness.downloads;
         assert!(downloads.transfers.key_by_token("uploader", 7).is_none());
         harness.drain();
@@ -1632,16 +1895,16 @@ mod tests {
     #[tokio::test]
     async fn a_new_session_watches_users_with_recoverable_downloads_only() {
         let mut harness = Harness::new("session-watch");
-        let offline = harness.queue_from("away", "a\\1.mp3");
+        let offline = harness.queue_from("away", "a\\1.mp3").await;
         let _ = harness.fail_connection(&offline, true);
-        let rejected = harness.queue_from("rejecter", "b\\1.mp3");
+        let rejected = harness.queue_from("rejecter", "b\\1.mp3").await;
         for _ in 0..2 {
             let _ = harness.deny(&rejected, TransferRejectReason::FILE_NOT_SHARED);
         }
         assert!(matches!(harness.phase(&rejected), TransferPhase::Failed(_)));
         harness.drain();
 
-        let fresh_key = harness.queue_from("fresh", "c\\1.mp3");
+        let fresh_key = harness.queue_from("fresh", "c\\1.mp3").await;
         harness.drain();
 
         harness.users = no_users();
@@ -1649,7 +1912,7 @@ mod tests {
         harness.send_watches();
         let sent = harness.drain();
         assert!(queue_uploads(&sent).is_empty());
-        assert!(harness.recover().is_empty());
+        assert!(harness.recover().await.is_empty());
         assert_eq!(queue_uploads(&harness.drain()), vec![fresh_key.1.as_str()]);
         let watched: HashSet<&str> = server_requests(&sent)
             .into_iter()
@@ -1666,9 +1929,10 @@ mod tests {
     #[tokio::test]
     async fn queue_limit_denials_hold_downloads_until_the_queue_drains() {
         let mut harness = Harness::new("queue-limit");
-        let keys: Vec<TransferKey> = (0..8)
-            .map(|index| harness.queue(&format!("a\\{index}.mp3")))
-            .collect();
+        let mut keys: Vec<TransferKey> = Vec::new();
+        for index in 0..8 {
+            keys.push(harness.queue(&format!("a\\{index}.mp3")).await);
+        }
         for key in &keys[1..] {
             let updates = harness.deny(key, TransferRejectReason::TOO_MANY_FILES);
             assert_eq!(statuses(&updates), vec![TransferStatus::Queued]);
@@ -1677,12 +1941,12 @@ mod tests {
         harness.drain();
 
         harness.downloads.release_limited();
-        assert!(harness.recover().is_empty());
+        assert!(harness.recover().await.is_empty());
 
         let _ = harness.request(&keys[0].1, 7, 100);
         harness.drain();
         harness.downloads.release_limited();
-        let released = harness.recover();
+        let released = harness.recover().await;
         assert_eq!(released.len(), MIN_LIMITED_BATCH);
         let sent = harness.drain();
         let expected: Vec<&str> = keys[1..=MIN_LIMITED_BATCH]
@@ -1691,13 +1955,13 @@ mod tests {
             .collect();
         assert_eq!(queue_uploads(&sent), expected);
         harness.downloads.release_limited();
-        assert!(harness.recover().is_empty());
+        assert!(harness.recover().await.is_empty());
 
         for key in &keys[1..=MIN_LIMITED_BATCH] {
             let _ = harness.deny(key, TransferRejectReason::TOO_MANY_MEGABYTES);
         }
         harness.downloads.release_limited();
-        let released = harness.recover();
+        let released = harness.recover().await;
         assert_eq!(released.len(), MIN_LIMITED_BATCH);
         let sent = harness.drain();
         let rotated: Vec<&str> = keys[MIN_LIMITED_BATCH + 1..]
@@ -1711,11 +1975,11 @@ mod tests {
     #[tokio::test]
     async fn connection_and_io_failures_retry_on_their_timers_and_rejections_do_not() {
         let mut harness = Harness::new("retry-timers");
-        let timed_out = harness.queue("a\\1.mp3");
-        let shutdown = harness.queue("a\\2.mp3");
-        let io = harness.queue("a\\3.mp3");
-        let rejected = harness.queue("a\\4.mp3");
-        let offline = harness.queue_from("gone", "b\\1.mp3");
+        let timed_out = harness.queue("a\\1.mp3").await;
+        let shutdown = harness.queue("a\\2.mp3").await;
+        let io = harness.queue("a\\3.mp3").await;
+        let rejected = harness.queue("a\\4.mp3").await;
+        let offline = harness.queue_from("gone", "b\\1.mp3").await;
         let _ = harness.fail_connection(&timed_out, false);
         let _ = harness.deny(&shutdown, TransferRejectReason::PENDING_SHUTDOWN);
         harness.start(&io.1, 9, 1);
@@ -1729,11 +1993,11 @@ mod tests {
         harness.downloads.start_session(&mut harness.users);
         harness.drain();
         harness.downloads.retry_failed();
-        assert!(harness.recover().is_empty());
+        assert!(harness.recover().await.is_empty());
 
         harness.downloads.connection_retry_at = past(CONNECTION_RETRY_INTERVAL);
         harness.downloads.retry_failed();
-        assert_eq!(harness.recover().len(), 2);
+        assert_eq!(harness.recover().await.len(), 2);
         assert_eq!(
             queue_uploads(&harness.drain()),
             vec![timed_out.1.as_str(), shutdown.1.as_str()]
@@ -1742,7 +2006,7 @@ mod tests {
 
         harness.downloads.io_retry_at = past(IO_RETRY_INTERVAL);
         harness.downloads.retry_failed();
-        assert_eq!(harness.recover().len(), 1);
+        assert_eq!(harness.recover().await.len(), 1);
         assert_eq!(queue_uploads(&harness.drain()), vec![io.1.as_str()]);
         assert_eq!(harness.phase(&rejected), failed("Banned"));
         assert_eq!(harness.phase(&offline), failed(USER_OFFLINE));
@@ -1751,13 +2015,16 @@ mod tests {
     #[tokio::test]
     async fn a_retry_timer_does_not_override_pending_offline_parking() {
         let mut harness = Harness::new("park-over-retry");
-        let key = harness.queue("a\\1.mp3");
+        let key = harness.queue("a\\1.mp3").await;
         let _ = harness.fail_connection(&key, false);
         harness.downloads.user_offline("uploader");
         harness.downloads.connection_retry_at = past(CONNECTION_RETRY_INTERVAL);
         harness.downloads.retry_failed();
         harness.drain();
-        assert_eq!(statuses(&harness.recover()), vec![TransferStatus::Failed]);
+        assert_eq!(
+            statuses(&harness.recover().await),
+            vec![TransferStatus::Failed]
+        );
         assert!(queue_uploads(&harness.drain()).is_empty());
         assert_eq!(harness.phase(&key), failed(USER_OFFLINE));
     }
@@ -1766,9 +2033,9 @@ mod tests {
     async fn queue_positions_are_requested_in_one_batch_per_user() {
         let mut harness = Harness::new("queue-positions");
         for index in 0..300 {
-            harness.queue(&format!("a\\{index}.mp3"));
+            harness.queue(&format!("a\\{index}.mp3")).await;
         }
-        harness.queue_from("other", "b\\1.mp3");
+        harness.queue_from("other", "b\\1.mp3").await;
         harness.drain();
         harness.downloads.queue_positions_at = past(QUEUE_POSITION_INTERVAL);
         harness.downloads.request_queue_positions();
@@ -1794,35 +2061,600 @@ mod tests {
         let mut harness = Harness::new("recovery-pacing");
         let total = RECOVERY_BATCH + 50;
         for index in 0..total {
-            let key = harness.queue(&format!("a\\{index}.mp3"));
+            let key = harness.queue(&format!("a\\{index}.mp3")).await;
             let _ = harness.fail_connection(&key, true);
             harness.drain();
         }
         harness.downloads.user_online("uploader");
-        assert_eq!(harness.recover().len(), RECOVERY_BATCH);
+        assert_eq!(harness.recover().await.len(), RECOVERY_BATCH);
         assert_eq!(queue_uploads(&harness.drain()).len(), RECOVERY_BATCH);
         harness.downloads.user_offline("uploader");
-        assert_eq!(harness.recover().len(), RECOVERY_BATCH);
-        assert!(harness.recover().is_empty());
+        assert_eq!(harness.recover().await.len(), RECOVERY_BATCH);
+        assert!(harness.recover().await.is_empty());
         assert!(queue_uploads(&harness.drain()).is_empty());
         harness.downloads.user_online("uploader");
-        assert_eq!(harness.recover().len(), RECOVERY_BATCH);
-        assert_eq!(harness.recover().len(), 50);
+        assert_eq!(harness.recover().await.len(), RECOVERY_BATCH);
+        assert_eq!(harness.recover().await.len(), 50);
     }
 
     #[tokio::test]
     async fn a_manual_retry_cancels_the_pending_automatic_one() {
         let mut harness = Harness::new("manual-retry");
-        let key = harness.queue("a\\1.mp3");
+        let key = harness.queue("a\\1.mp3").await;
         let _ = harness.fail_connection(&key, true);
         harness.downloads.user_online("uploader");
         let id = harness.transfer(&key).id;
         let (result, _) = harness.downloads.retry(&mut harness.users, id);
         assert_eq!(result, RetryResult::Requeued);
+        harness.settle().await;
         let _ = harness.deny(&key, TransferRejectReason::TOO_MANY_FILES);
         harness.drain();
-        assert!(harness.recover().is_empty());
+        assert!(harness.recover().await.is_empty());
         assert!(queue_uploads(&harness.drain()).is_empty());
         assert_eq!(harness.phase(&key), TransferPhase::Limited);
+    }
+
+    type Scripted = (Duration, Vec<io::Result<Option<String>>>);
+
+    struct ScriptedStore {
+        answers: std::sync::Mutex<VecDeque<Scripted>>,
+    }
+
+    impl ScriptedStore {
+        fn answering(answers: Vec<Vec<io::Result<Option<String>>>>) -> Arc<dyn DownloadStore> {
+            Self::answering_after(
+                answers
+                    .into_iter()
+                    .map(|answer| (Duration::ZERO, answer))
+                    .collect(),
+            )
+        }
+
+        fn answering_after(answers: Vec<Scripted>) -> Arc<dyn DownloadStore> {
+            Arc::new(Self {
+                answers: std::sync::Mutex::new(answers.into()),
+            })
+        }
+    }
+
+    impl DownloadStore for ScriptedStore {
+        fn destination(&self, _: &DownloadRequest<'_>) -> String {
+            "scripted".into()
+        }
+
+        fn existing(
+            &self,
+            _: Vec<Download>,
+        ) -> crate::types::BoxFuture<Vec<io::Result<Option<String>>>> {
+            let (delay, answer) = self
+                .answers
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("a scripted answer");
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                answer
+            })
+        }
+
+        fn open(
+            &self,
+            _: Download,
+            _: bool,
+        ) -> crate::types::BoxFuture<io::Result<crate::storage::OpenedDownload>> {
+            unreachable!("scripted downloads never open")
+        }
+
+        fn finish(&self, _: Download) -> crate::types::BoxFuture<io::Result<String>> {
+            unreachable!("scripted downloads never finish")
+        }
+
+        fn discard(&self, _: Download) -> crate::types::BoxFuture<io::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl Harness {
+        fn opener(&mut self) -> OpenDownload {
+            self.drain()
+                .into_iter()
+                .find_map(|command| match command {
+                    NetworkCommand::DownloadFile { open, .. } => Some(open),
+                    _ => None,
+                })
+                .expect("a download command")
+        }
+
+        async fn write_partial(&mut self, bytes: &[u8]) -> u64 {
+            use tokio::io::AsyncWriteExt;
+            let (mut writer, offset) = self.opener().open().await.unwrap();
+            writer.write_all(bytes).await.unwrap();
+            writer.shutdown().await.unwrap();
+            offset
+        }
+
+        fn partials(&self) -> usize {
+            std::fs::read_dir(self.dir.join("incomplete")).map_or(0, |entries| entries.count())
+        }
+
+        async fn wait_for_partials(&self, count: usize) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while self.partials() != count {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the partial count to settle");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_existence_check_fails_the_download_as_a_local_error() {
+        let mut harness = Harness::new("check-error");
+        harness
+            .downloads
+            .set_store(ScriptedStore::answering(vec![vec![Err(io::Error::other(
+                "bucket unreachable",
+            ))]]));
+        let key = harness.queue("Music\\a.mp3").await;
+        assert_eq!(
+            harness.phase(&key),
+            failed(&format!("{LOCAL_FILE_ERROR}: bucket unreachable"))
+        );
+        assert!(queue_uploads(&harness.drain()).is_empty());
+        assert_eq!(recovery(&harness.phase(&key)), Some(Recovery::Io));
+    }
+
+    #[tokio::test]
+    async fn a_store_answering_the_wrong_number_of_checks_fails_the_whole_batch() {
+        let mut harness = Harness::new("check-count");
+        harness
+            .downloads
+            .set_store(ScriptedStore::answering(vec![vec![Ok(None)]]));
+        let files = ["share\\a.mp3", "share\\b.mp3"]
+            .into_iter()
+            .map(|name| FileInfo {
+                name: name.into(),
+                size: 100,
+                attributes: FileAttributes::default(),
+            })
+            .collect();
+        let _ = harness.downloads.enqueue_folder(
+            &mut harness.ids,
+            &mut harness.users,
+            "uploader".into(),
+            files,
+            "share",
+        );
+        let work = harness.settle().await;
+        assert_eq!(
+            statuses(&work),
+            vec![TransferStatus::Failed, TransferStatus::Failed]
+        );
+        assert!(queue_uploads(&harness.drain()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_answer_for_an_earlier_check_is_ignored() {
+        let mut harness = Harness::new("stale-check");
+        harness.downloads.set_store(ScriptedStore::answering(vec![
+            vec![Ok(Some("already here".into()))],
+            vec![Ok(None)],
+        ]));
+        let (_, _) = harness.downloads.enqueue(
+            &mut harness.ids,
+            &mut harness.users,
+            "uploader".into(),
+            FileInfo {
+                name: "Music\\a.mp3".into(),
+                size: 100,
+                attributes: FileAttributes::default(),
+            },
+            None,
+        );
+        let key = ("uploader".to_owned(), "Music\\a.mp3".to_owned());
+        let id = harness.transfer(&key).id;
+        let _ = harness.downloads.abort(id);
+        let _ = harness.downloads.retry(&mut harness.users, id);
+        harness.settle().await;
+        assert_eq!(harness.phase(&key), TransferPhase::Queued);
+        assert_eq!(queue_uploads(&harness.drain()), vec![key.1.as_str()]);
+    }
+
+    #[tokio::test]
+    async fn a_started_download_resumes_its_partial_and_restarts_it_when_the_size_changed() {
+        let mut harness = Harness::new("resume");
+        let key = harness.queue("Music\\a.mp3").await;
+        harness.start(&key.1, 7, 1);
+        assert_eq!(harness.write_partial(b"abc").await, 0);
+        let _ = harness.downloads.handle_file_connection_closed(1);
+
+        let id = harness.transfer(&key).id;
+        let _ = harness.downloads.retry(&mut harness.users, id);
+        harness.settle().await;
+        harness.start(&key.1, 8, 2);
+        assert_eq!(harness.write_partial(b"").await, 3);
+        let _ = harness.downloads.handle_file_connection_closed(2);
+
+        let id = harness.transfer(&key).id;
+        let _ = harness.downloads.retry(&mut harness.users, id);
+        harness.settle().await;
+        let _ = harness.request(&key.1, 9, 250);
+        let _ = harness
+            .downloads
+            .handle_file_transfer_init("uploader", 9, 3);
+        assert_eq!(harness.write_partial(b"").await, 0);
+    }
+
+    #[tokio::test]
+    async fn clearing_an_idle_download_discards_its_partial() {
+        let mut harness = Harness::new("discard-idle");
+        let key = harness.queue("Music\\a.mp3").await;
+        harness.start(&key.1, 7, 1);
+        harness.write_partial(b"abc").await;
+        let _ = harness.downloads.handle_transfer_error(1, "reset by peer");
+        assert!(
+            harness
+                .downloads
+                .handle_file_connection_closed(1)
+                .is_empty()
+        );
+        assert_eq!(harness.partials(), 1);
+
+        harness.downloads.clear(None);
+        harness.wait_for_partials(0).await;
+    }
+
+    #[tokio::test]
+    async fn clearing_an_aborted_download_waits_for_its_connection_to_close() {
+        let mut harness = Harness::new("discard-aborted");
+        let key = harness.queue("Music\\a.mp3").await;
+        harness.start(&key.1, 7, 1);
+        harness.write_partial(b"abc").await;
+        let _ = harness.downloads.abort(harness.transfer(&key).id);
+        assert!(harness.closed(1));
+
+        harness.downloads.clear(None);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(harness.partials(), 1);
+        assert!(
+            harness
+                .downloads
+                .handle_file_connection_closed(1)
+                .is_empty()
+        );
+        harness.wait_for_partials(0).await;
+    }
+
+    #[tokio::test]
+    async fn a_server_drop_discards_downloads_whose_connections_it_closed_silently() {
+        let mut harness = Harness::new("discard-reset");
+        let key = harness.queue("Music\\a.mp3").await;
+        harness.start(&key.1, 7, 1);
+        harness.write_partial(b"abc").await;
+        harness.downloads.clear(None);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(harness.partials(), 1);
+
+        let _ = harness.downloads.reset();
+        harness.wait_for_partials(0).await;
+    }
+
+    #[tokio::test]
+    async fn clearing_a_transferring_download_discards_once_its_connection_closes() {
+        let mut harness = Harness::new("discard-conn");
+        let key = harness.queue("Music\\a.mp3").await;
+        harness.start(&key.1, 7, 1);
+        harness.write_partial(b"abc").await;
+
+        assert_eq!(harness.downloads.clear(None).len(), 1);
+        assert!(harness.closed(1));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(harness.partials(), 1);
+
+        assert!(
+            harness
+                .downloads
+                .handle_file_connection_closed(1)
+                .is_empty()
+        );
+        harness.wait_for_partials(0).await;
+    }
+
+    #[tokio::test]
+    async fn a_finished_download_is_placed_and_clearing_it_keeps_the_file() {
+        let mut harness = Harness::new("place");
+        let key = harness.queue("Music\\a.mp3").await;
+        harness.start(&key.1, 7, 1);
+        harness.write_partial(&[1u8; 100]).await;
+        let placing = harness.downloads.handle_download_progress(1, 0);
+        assert_eq!(statuses(&placing), vec![TransferStatus::Transferring]);
+
+        let placed = harness.placed().await;
+        let location = harness.dir.join("complete/a.mp3");
+        assert!(matches!(
+            placed.as_slice(),
+            [TransferWork::Finished { snapshot, delivered_bytes: 100, .. }]
+                if snapshot.file_path.as_deref() == location.to_str()
+        ));
+        assert_eq!(harness.partials(), 0);
+
+        harness.downloads.clear(None);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(std::fs::read(location).unwrap(), vec![1u8; 100]);
+    }
+
+    #[tokio::test]
+    async fn check_answers_apply_in_admission_order() {
+        let mut harness = Harness::new("check-order");
+        harness
+            .downloads
+            .set_store(ScriptedStore::answering_after(vec![
+                (Duration::from_millis(100), vec![Ok(None)]),
+                (Duration::ZERO, vec![Ok(None)]),
+            ]));
+        for name in ["Music\\a.mp3", "Music\\b.mp3"] {
+            let file = FileInfo {
+                name: name.into(),
+                size: 100,
+                attributes: FileAttributes::default(),
+            };
+            let _ = harness.downloads.enqueue(
+                &mut harness.ids,
+                &mut harness.users,
+                "uploader".into(),
+                file,
+                None,
+            );
+        }
+        harness.settle().await;
+        assert_eq!(
+            queue_uploads(&harness.drain()),
+            vec!["Music\\a.mp3", "Music\\b.mp3"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_download_checked_while_logged_out_is_requested_at_the_next_login() {
+        let mut harness = Harness::new("logged-out");
+        harness.logged_in = false;
+        let key = harness.queue("Music\\a.mp3").await;
+        assert_eq!(harness.phase(&key), TransferPhase::Queued);
+        assert!(queue_uploads(&harness.drain()).is_empty());
+
+        harness.downloads.start_session(&mut harness.users);
+        harness.recover().await;
+        assert_eq!(queue_uploads(&harness.drain()), vec![key.1.as_str()]);
+    }
+
+    #[tokio::test]
+    async fn seeded_queued_downloads_are_checked_before_they_are_requested() {
+        let mut harness = Harness::new("seed-check");
+        let destination = harness.dir.join("complete");
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(destination.join("done.mp3"), vec![0u8; 100]).unwrap();
+        for (id, name) in [(1, "Music\\done.mp3"), (2, "Music\\missing.mp3")] {
+            harness.downloads.seed(TransferSnapshot {
+                id: TransferId(id),
+                direction: TransferDirection::Download,
+                username: "uploader".into(),
+                virtual_path: name.into(),
+                destination: Some(destination.display().to_string()),
+                size: 100,
+                bytes_done: 0,
+                status: TransferStatus::Queued,
+                failure_reason: None,
+                file_path: None,
+                queue_place: 0,
+                speed_bps: 0,
+                attributes: FileAttributes::default(),
+            });
+        }
+        harness.downloads.check_seeded();
+        let work = harness.settle().await;
+        assert!(matches!(
+            work.as_slice(),
+            [TransferWork::Finished { snapshot, .. }] if snapshot.id == TransferId(1)
+        ));
+        let missing = ("uploader".to_owned(), "Music\\missing.mp3".to_owned());
+        assert_eq!(harness.phase(&missing), TransferPhase::Queued);
+        assert_eq!(queue_uploads(&harness.drain()), vec![missing.1.as_str()]);
+    }
+
+    struct GatedStore {
+        local: Arc<dyn DownloadStore>,
+        gate: Arc<tokio::sync::Notify>,
+    }
+
+    impl DownloadStore for GatedStore {
+        fn destination(&self, request: &DownloadRequest<'_>) -> String {
+            self.local.destination(request)
+        }
+
+        fn existing(
+            &self,
+            downloads: Vec<Download>,
+        ) -> crate::types::BoxFuture<Vec<io::Result<Option<String>>>> {
+            self.local.existing(downloads)
+        }
+
+        fn open(
+            &self,
+            download: Download,
+            restart: bool,
+        ) -> crate::types::BoxFuture<io::Result<crate::storage::OpenedDownload>> {
+            self.local.open(download, restart)
+        }
+
+        fn finish(&self, download: Download) -> crate::types::BoxFuture<io::Result<String>> {
+            let (gate, finished) = (self.gate.clone(), self.local.finish(download));
+            Box::pin(async move {
+                gate.notified().await;
+                finished.await
+            })
+        }
+
+        fn discard(&self, download: Download) -> crate::types::BoxFuture<io::Result<()>> {
+            self.local.discard(download)
+        }
+    }
+
+    #[tokio::test]
+    async fn clearing_a_placing_download_waits_for_the_placement() {
+        let mut harness = Harness::new("discard-placing");
+        let gate = Arc::new(tokio::sync::Notify::new());
+        harness.downloads.set_store(Arc::new(GatedStore {
+            local: local_store(&harness.dir, false),
+            gate: gate.clone(),
+        }));
+        let key = harness.queue("Music\\a.mp3").await;
+        harness.start(&key.1, 7, 1);
+        harness.write_partial(&[1u8; 100]).await;
+        let _ = harness.downloads.handle_download_progress(1, 0);
+        harness.downloads.clear(None);
+        assert!(
+            harness
+                .downloads
+                .handle_file_connection_closed(1)
+                .is_empty()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(harness.partials(), 1);
+
+        gate.notify_one();
+        assert!(harness.placed().await.is_empty());
+        assert_eq!(
+            std::fs::read(harness.dir.join("complete/a.mp3")).unwrap(),
+            vec![1u8; 100]
+        );
+        assert_eq!(harness.partials(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_placement_answer_for_an_earlier_placement_is_ignored() {
+        let mut harness = Harness::new("stale-placement");
+        let key = harness.queue("Music\\a.mp3").await;
+        harness.start(&key.1, 7, 1);
+        harness.write_partial(&[1u8; 100]).await;
+        let _ = harness.downloads.handle_download_progress(1, 0);
+        let stale = harness
+            .downloads
+            .handle_placement_done(&key, u64::MAX, Ok("elsewhere".into()));
+        assert!(stale.is_empty());
+        assert_eq!(harness.phase(&key), TransferPhase::Placing);
+        let placed = harness.placed().await;
+        assert!(matches!(placed.as_slice(), [TransferWork::Finished { .. }]));
+        assert_eq!(
+            harness.transfer(&key).file_path.as_deref(),
+            harness.dir.join("complete/a.mp3").to_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn enqueueing_a_cleared_download_again_keeps_its_partial() {
+        let mut harness = Harness::new("discard-cancel");
+        let key = harness.queue("Music\\a.mp3").await;
+        harness.start(&key.1, 7, 1);
+        harness.write_partial(b"abc").await;
+        let _ = harness.downloads.abort(harness.transfer(&key).id);
+        harness.downloads.clear(None);
+        harness.queue(&key.1).await;
+        assert!(
+            harness
+                .downloads
+                .handle_file_connection_closed(1)
+                .is_empty()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(harness.partials(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_retry_watches_the_uploader_again() {
+        let mut harness = Harness::new("retry-watch");
+        let key = harness.queue("Music\\a.mp3").await;
+        let _ = harness.fail_connection(&key, false);
+        harness.users = no_users();
+        let id = harness.transfer(&key).id;
+        let _ = harness.downloads.retry(&mut harness.users, id);
+        harness.settle().await;
+        harness.drain();
+        harness.send_watches();
+        assert_watches_the_uploader_once(&harness.drain());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_existence_check_times_out() {
+        let mut harness = Harness::new("check-timeout");
+        harness
+            .downloads
+            .set_store(ScriptedStore::answering_after(vec![(
+                Duration::from_secs(3600),
+                vec![Ok(None)],
+            )]));
+        let file = FileInfo {
+            name: "Music\\a.mp3".into(),
+            size: 100,
+            attributes: FileAttributes::default(),
+        };
+        let _ = harness.downloads.enqueue(
+            &mut harness.ids,
+            &mut harness.users,
+            "uploader".into(),
+            file,
+            None,
+        );
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(CHECK_TIMEOUT + Duration::from_secs(1)).await;
+        harness.settle().await;
+        let key = ("uploader".to_owned(), "Music\\a.mp3".to_owned());
+        assert_eq!(
+            harness.phase(&key),
+            failed(&format!(
+                "{LOCAL_FILE_ERROR}: the existence check timed out"
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_downloads_that_cannot_be_checked_are_requested_quietly() {
+        let mut harness = Harness::new("seed-check-error");
+        harness.logged_in = false;
+        harness
+            .downloads
+            .set_store(ScriptedStore::answering(vec![vec![
+                Err(io::Error::other("bucket unreachable")),
+                Err(io::Error::other("bucket unreachable")),
+            ]]));
+        for (id, name) in [(1, "Music\\a.mp3"), (2, "Music\\b.mp3")] {
+            harness.downloads.seed(TransferSnapshot {
+                id: TransferId(id),
+                direction: TransferDirection::Download,
+                username: "uploader".into(),
+                virtual_path: name.into(),
+                destination: Some("scripted".into()),
+                size: 100,
+                bytes_done: 0,
+                status: TransferStatus::Queued,
+                failure_reason: None,
+                file_path: None,
+                queue_place: 0,
+                speed_bps: 0,
+                attributes: FileAttributes::default(),
+            });
+        }
+        harness.downloads.check_seeded();
+        assert!(harness.settle().await.is_empty());
+        assert!(queue_uploads(&harness.drain()).is_empty());
+
+        harness.downloads.start_session(&mut harness.users);
+        harness.recover().await;
+        assert_eq!(
+            queue_uploads(&harness.drain()),
+            vec!["Music\\a.mp3", "Music\\b.mp3"]
+        );
     }
 }

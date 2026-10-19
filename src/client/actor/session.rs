@@ -4,7 +4,6 @@ use tokio::time::Instant;
 use tracing::{info, warn};
 
 use super::ClientActor;
-use super::sharing::ScanJob;
 use crate::client::ClientEvent;
 use crate::network::NetworkCommand;
 use crate::protocol::ServerRequest;
@@ -45,7 +44,7 @@ impl Session {
 
 impl ClientActor {
     pub(super) fn connect(&mut self) {
-        if self.sharing.cached_loading {
+        if self.sharing.loading {
             info!("waiting for the cached share index before connecting");
             self.session.connect_deferred = true;
             self.session.reconnect_at = None;
@@ -55,7 +54,7 @@ impl ClientActor {
     }
 
     pub(super) fn connect_if_deferred(&mut self) {
-        if self.session.connect_deferred && !self.sharing.cached_loading {
+        if self.session.connect_deferred && !self.sharing.loading {
             self.connect_now();
         }
     }
@@ -103,17 +102,7 @@ impl ClientActor {
             );
             let updates = self.uploads.check_queue(&self.users);
             self.emit_transfers(updates);
-            self.downloads.set_dirs(
-                transfers.download_dir,
-                transfers.incomplete_dir,
-                transfers.download_username_subfolders,
-            );
             self.set_transfer_limits(transfers.upload_limit_kbps, transfers.download_limit_kbps);
-        }
-        if self.config.shared_folders != old.shared_folders
-            || self.config.share_filters != old.share_filters
-        {
-            self.start_scan(ScanJob::RELOAD);
         }
         if !self.config.auto_reconnect {
             self.session.reconnect_at = None;

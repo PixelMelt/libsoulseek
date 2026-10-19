@@ -1,6 +1,6 @@
 # 29. The library owns its configuration rules
 
-Status: Accepted
+Status: Accepted (superseded in part by ADR 0032)
 Nicotine+: No counterpart
 
 ## Context

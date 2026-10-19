@@ -1,10 +1,55 @@
-use std::fs::File;
+use std::fmt;
+use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 
 use crate::protocol::{PeerMessage, ServerRequest, ServerResponse};
-use crate::types::{ConnectionType, TransferDirection};
+use crate::types::{BoxFuture, ConnectionType, FileReader, FileWriter, TransferDirection};
 
 pub type ConnId = u64;
+
+type DownloadOpener = Box<dyn FnOnce() -> BoxFuture<io::Result<(FileWriter, u64)>> + Send>;
+
+type UploadOpener = Box<dyn FnOnce(u64) -> BoxFuture<io::Result<FileReader>> + Send>;
+
+pub struct OpenDownload(DownloadOpener);
+
+impl OpenDownload {
+    pub fn new(
+        open: impl FnOnce() -> BoxFuture<io::Result<(FileWriter, u64)>> + Send + 'static,
+    ) -> Self {
+        Self(Box::new(open))
+    }
+
+    pub(crate) fn open(self) -> BoxFuture<io::Result<(FileWriter, u64)>> {
+        (self.0)()
+    }
+}
+
+impl fmt::Debug for OpenDownload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("OpenDownload")
+    }
+}
+
+pub struct OpenUpload(UploadOpener);
+
+impl OpenUpload {
+    pub fn new(
+        open: impl FnOnce(u64) -> BoxFuture<io::Result<FileReader>> + Send + 'static,
+    ) -> Self {
+        Self(Box::new(open))
+    }
+
+    pub(crate) fn open(self, offset: u64) -> BoxFuture<io::Result<FileReader>> {
+        (self.0)(offset)
+    }
+}
+
+impl fmt::Debug for OpenUpload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("OpenUpload")
+    }
+}
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub enum AllowedResponse {
@@ -42,13 +87,12 @@ pub enum NetworkCommand {
     },
     DownloadFile {
         conn_id: ConnId,
-        file: File,
-        offset: u64,
-        bytes_left: u64,
+        open: OpenDownload,
+        size: u64,
     },
     UploadFile {
         conn_id: ConnId,
-        file: File,
+        open: OpenUpload,
         size: u64,
     },
     SetTransferLimits {

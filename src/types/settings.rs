@@ -1,7 +1,6 @@
 use std::net::SocketAddr;
-use std::path::PathBuf;
 
-use crate::types::{DescriptionTemplate, SharedFolder};
+use crate::types::DescriptionTemplate;
 
 pub const DEFAULT_SERVER: &str = "server.slsknet.org:2242";
 pub const DEFAULT_UPLOAD_SLOTS: usize = 2;
@@ -20,29 +19,10 @@ pub struct RuntimeConfig {
     pub auto_reconnect: bool,
     pub transfers: TransferConfig,
     pub search: SearchConfig,
-    pub shared_folders: Vec<SharedFolder>,
-    pub share_filters: Vec<String>,
 }
 
 impl RuntimeConfig {
     pub fn validate(&self) -> Result<(), String> {
-        for share in &self.shared_folders {
-            if share.virtual_name.is_empty() || share.virtual_name.contains(['/', '\\']) {
-                return Err(format!(
-                    "share name {:?} is invalid: remote clients rewrite slashes in \
-                     virtual paths and their download requests would no longer match",
-                    share.virtual_name
-                ));
-            }
-        }
-        for filter in &self.share_filters {
-            if filter.is_empty() || filter.contains(['/', '\\']) {
-                return Err(format!(
-                    "share filter {filter:?} is invalid: filters match exact file or \
-                     folder names and cannot be empty or contain path separators"
-                ));
-            }
-        }
         let transfers = &self.transfers;
         if transfers.upload_slots == 0 || transfers.upload_slots > MAX_UPLOAD_SLOTS {
             return Err(format!("upload_slots must be 1-{MAX_UPLOAD_SLOTS}"));
@@ -81,15 +61,12 @@ pub struct LoginConfig {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TransferConfig {
-    pub download_dir: PathBuf,
-    pub incomplete_dir: PathBuf,
     pub upload_slots: usize,
     pub queue_file_limit: usize,
     pub upload_limit_kbps: u32,
     pub download_limit_kbps: u32,
     pub queue_size_limit_mb: u64,
     pub banned_message: String,
-    pub download_username_subfolders: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -124,58 +101,15 @@ mod tests {
             description: DescriptionTemplate::default(),
             auto_reconnect: true,
             transfers: TransferConfig {
-                download_dir: PathBuf::from("downloads"),
-                incomplete_dir: PathBuf::from("downloads/incomplete"),
                 upload_slots: DEFAULT_UPLOAD_SLOTS,
                 queue_file_limit: DEFAULT_QUEUE_FILE_LIMIT,
                 upload_limit_kbps: 0,
                 download_limit_kbps: 0,
                 queue_size_limit_mb: 0,
                 banned_message: DEFAULT_BANNED_MESSAGE.into(),
-                download_username_subfolders: false,
             },
             search: SearchConfig::default(),
-            shared_folders: Vec::new(),
-            share_filters: Vec::new(),
         }
-    }
-
-    #[test]
-    fn share_names_with_slashes_are_rejected() {
-        let with_share = |name: &str| RuntimeConfig {
-            shared_folders: vec![SharedFolder {
-                virtual_name: name.into(),
-                path: PathBuf::from("/data/shared"),
-                buddy_only: false,
-            }],
-            ..config()
-        };
-        for name in ["/", "a/b", "a\\b", ""] {
-            assert!(
-                with_share(name).validate().is_err(),
-                "{name:?} must be rejected"
-            );
-        }
-        assert!(with_share("Music").validate().is_ok());
-    }
-
-    #[test]
-    fn share_filters_must_be_plain_names() {
-        let with_filters = |filters: &[&str]| RuntimeConfig {
-            share_filters: filters.iter().map(|filter| (*filter).to_owned()).collect(),
-            ..config()
-        };
-        for filter in ["", "a/b", "a\\b"] {
-            assert!(
-                with_filters(&[filter]).validate().is_err(),
-                "{filter:?} must be rejected"
-            );
-        }
-        assert!(
-            with_filters(&["Thumbs.db", "desktop.ini"])
-                .validate()
-                .is_ok()
-        );
     }
 
     #[test]

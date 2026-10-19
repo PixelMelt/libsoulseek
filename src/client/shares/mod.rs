@@ -1,106 +1,27 @@
-mod audio;
-mod cache;
-mod scan;
 mod wire;
-
-pub use cache::{load as load_catalog, save as save_catalog};
-pub use scan::{ScanError, restrict, walk};
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
-use std::path::PathBuf;
+use std::sync::Arc;
 
 use super::punctuation::split_words;
+use crate::storage::{CatalogError, CatalogFolder, ShareCatalog, ShareKey, ShareSource};
 use crate::types::{FileAttributes, FileInfo, FolderContents};
 
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct ShareCatalog {
-    pub folders: Vec<ShareCatalogFolder>,
-    pub files: Vec<ShareCatalogFile>,
-    #[serde(skip)]
-    folders_by_path: Vec<u32>,
-}
-
 pub fn empty_browse_frame() -> Vec<u8> {
-    wire::encode_shared_file_list(&ShareCatalog::empty(), false)
-}
-
-impl ShareCatalog {
-    pub(super) fn empty() -> Self {
-        Self::default()
-    }
-
-    pub(super) fn push_folder(
-        &mut self,
-        virtual_path: String,
-        real_path: PathBuf,
-        buddy_only: bool,
-        files: impl IntoIterator<Item = ShareCatalogFile>,
-    ) {
-        let start = self.files.len() as u32;
-        self.files.extend(files);
-        self.folders.push(ShareCatalogFolder {
-            virtual_path_lower: virtual_path.to_lowercase().into_boxed_str(),
-            virtual_path: virtual_path.into_boxed_str(),
-            real_path,
-            files: start..self.files.len() as u32,
-            buddy_only,
-        });
-    }
-
-    pub(super) fn folder_files(&self, folder: &ShareCatalogFolder) -> &[ShareCatalogFile] {
-        &self.files[folder.files.start as usize..folder.files.end as usize]
-    }
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ShareCatalogFolder {
-    pub virtual_path: Box<str>,
-    pub virtual_path_lower: Box<str>,
-    #[serde(with = "cache::path_bytes")]
-    pub real_path: PathBuf,
-    pub files: Range<u32>,
-    pub buddy_only: bool,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ShareCatalogFile {
-    pub name: Box<str>,
-    pub name_lower: Box<str>,
-    pub real_name: std::ffi::OsString,
-    pub size: u64,
-    pub mtime: u64,
-    pub attributes: FileAttributes,
-}
-
-impl ShareCatalogFile {
-    pub(super) fn new(
-        name: String,
-        real_name: std::ffi::OsString,
-        size: u64,
-        mtime: u64,
-        attributes: FileAttributes,
-    ) -> Self {
-        Self {
-            name_lower: name.to_lowercase().into_boxed_str(),
-            name: name.into_boxed_str(),
-            real_name,
-            size,
-            mtime,
-            attributes,
-        }
-    }
+    wire::encode_shared_file_list(&ShareCatalog::new(), &[], false)
 }
 
 #[derive(Debug, Default)]
-pub(super) struct WordPostings {
-    pub(super) files: Vec<u32>,
-    pub(super) folders: Vec<u32>,
+struct WordPostings {
+    files: Vec<u32>,
+    folders: Vec<u32>,
 }
 
-#[derive(Debug)]
 pub struct SharesIndex {
-    catalog: ShareCatalog,
+    catalog: Arc<ShareCatalog>,
+    source: Arc<dyn ShareSource>,
+    folders_by_path: Vec<u32>,
     folders_by_lower_path: Vec<u32>,
     resolve_files: Vec<u32>,
     word_ids: HashMap<Box<str>, u32>,
@@ -132,45 +53,56 @@ fn index_words(
 }
 
 impl SharesIndex {
-    pub fn from_catalog(mut catalog: ShareCatalog) -> Self {
+    pub fn from_catalog(
+        catalog: Arc<ShareCatalog>,
+        source: Arc<dyn ShareSource>,
+    ) -> Result<Self, CatalogError> {
+        let folders = catalog.folders();
+        let files = catalog.all_files();
+        let mut folders_by_path: Vec<u32> = (0..folders.len() as u32).collect();
+        folders_by_path.sort_by(|&left, &right| {
+            folders[left as usize]
+                .virtual_path()
+                .cmp(folders[right as usize].virtual_path())
+        });
+        if let Some(pair) = folders_by_path.windows(2).find(|pair| {
+            folders[pair[0] as usize].virtual_path() == folders[pair[1] as usize].virtual_path()
+        }) {
+            return Err(CatalogError::DuplicateFolder(
+                folders[pair[0] as usize].virtual_path().to_owned(),
+            ));
+        }
+
         let mut word_index: HashMap<Box<str>, WordPostings> = HashMap::new();
-        for (folder_id, folder) in catalog.folders.iter().enumerate() {
-            if !folder.files.is_empty() {
-                index_words(&mut word_index, &folder.virtual_path_lower, |postings| {
+        for (folder_id, folder) in folders.iter().enumerate() {
+            if !folder.file_range().is_empty() {
+                index_words(&mut word_index, folder.virtual_path_lower(), |postings| {
                     postings.folders.push(folder_id as u32)
                 });
             }
-            for file_id in folder.files.clone() {
+            for file_id in folder.file_range() {
                 index_words(
                     &mut word_index,
-                    &catalog.files[file_id as usize].name_lower,
+                    files[file_id as usize].name_lower(),
                     |postings| postings.files.push(file_id),
                 );
             }
         }
-        catalog.folders_by_path = (0..catalog.folders.len() as u32).collect();
-        catalog.folders_by_path.sort_by(|&left, &right| {
-            catalog.folders[left as usize]
-                .virtual_path
-                .cmp(&catalog.folders[right as usize].virtual_path)
-        });
-        let mut folders_by_lower_path = catalog.folders_by_path.clone();
+        let mut folders_by_lower_path = folders_by_path.clone();
         folders_by_lower_path.sort_by(|&left, &right| {
-            let left_folder = &catalog.folders[left as usize];
-            let right_folder = &catalog.folders[right as usize];
-            left_folder
-                .virtual_path_lower
-                .cmp(&right_folder.virtual_path_lower)
+            folders[left as usize]
+                .virtual_path_lower()
+                .cmp(folders[right as usize].virtual_path_lower())
                 .then_with(|| left.cmp(&right))
         });
-        let mut resolve_files = Vec::with_capacity(catalog.files.len());
-        for folder in &catalog.folders {
+        let mut resolve_files = Vec::with_capacity(files.len());
+        for folder in folders {
             let start = resolve_files.len();
-            resolve_files.extend(folder.files.clone());
+            resolve_files.extend(folder.file_range());
             resolve_files[start..].sort_by(|&left, &right| {
-                catalog.files[left as usize]
-                    .name_lower
-                    .cmp(&catalog.files[right as usize].name_lower)
+                files[left as usize]
+                    .name_lower()
+                    .cmp(files[right as usize].name_lower())
                     .then_with(|| left.cmp(&right))
             });
         }
@@ -186,24 +118,21 @@ impl SharesIndex {
         }
         suffixes.sort_unstable();
 
-        let public_folders = catalog
-            .folders
+        let public_folders = folders.iter().filter(|folder| !folder.buddy_only()).count();
+        let public_files = folders
             .iter()
-            .filter(|folder| !folder.buddy_only)
-            .count();
-        let public_files = catalog
-            .folders
-            .iter()
-            .filter(|folder| !folder.buddy_only)
-            .map(|folder| folder.files.len())
+            .filter(|folder| !folder.buddy_only())
+            .map(|folder| folder.file_range().len())
             .sum::<usize>();
-        let has_buddy_folders = public_folders < catalog.folders.len();
-        let public_browse_frame = wire::encode_shared_file_list(&catalog, false);
-        let buddy_browse_frame =
-            has_buddy_folders.then(|| wire::encode_shared_file_list(&catalog, true));
+        let has_buddy_folders = public_folders < folders.len();
+        let public_browse_frame = wire::encode_shared_file_list(&catalog, &folders_by_path, false);
+        let buddy_browse_frame = has_buddy_folders
+            .then(|| wire::encode_shared_file_list(&catalog, &folders_by_path, true));
 
-        Self {
+        Ok(Self {
             catalog,
+            source,
+            folders_by_path,
             folders_by_lower_path,
             resolve_files,
             word_ids,
@@ -212,7 +141,11 @@ impl SharesIndex {
             public_counts: (public_folders as u32, public_files as u32),
             public_browse_frame,
             buddy_browse_frame,
-        }
+        })
+    }
+
+    pub fn source(&self) -> &Arc<dyn ShareSource> {
+        &self.source
     }
 
     pub fn counts(&self) -> (u32, u32) {
@@ -228,26 +161,24 @@ impl SharesIndex {
 
     #[cfg(test)]
     pub fn browse(&self, is_buddy: bool) -> Vec<FolderContents> {
-        self.catalog
-            .folders_by_path
+        self.folders_by_path
             .iter()
-            .map(|&folder| &self.catalog.folders[folder as usize])
-            .filter(|folder| is_buddy || !folder.buddy_only)
+            .map(|&folder| &self.catalog.folders()[folder as usize])
+            .filter(|folder| is_buddy || !folder.buddy_only())
             .map(|folder| self.folder_view(folder))
             .collect()
     }
 
     pub fn folder_contents(&self, directory: &str, is_buddy: bool) -> Vec<FolderContents> {
-        let Ok(position) = self.catalog.folders_by_path.binary_search_by(|&folder| {
-            self.catalog.folders[folder as usize]
-                .virtual_path
-                .as_ref()
-                .cmp(directory)
-        }) else {
+        let folders = self.catalog.folders();
+        let Ok(position) = self
+            .folders_by_path
+            .binary_search_by(|&folder| folders[folder as usize].virtual_path().cmp(directory))
+        else {
             return Vec::new();
         };
-        let folder = &self.catalog.folders[self.catalog.folders_by_path[position] as usize];
-        if folder.buddy_only && !is_buddy {
+        let folder = &folders[self.folders_by_path[position] as usize];
+        if folder.buddy_only() && !is_buddy {
             return Vec::new();
         }
         vec![self.folder_view(folder)]
@@ -257,31 +188,30 @@ impl SharesIndex {
         &self,
         virtual_path: &str,
         is_buddy: bool,
-    ) -> Option<(PathBuf, u64, &crate::types::FileAttributes)> {
+    ) -> Option<(ShareKey, u64, &FileAttributes)> {
+        let folders = self.catalog.folders();
+        let files = self.catalog.all_files();
         let (directory, name) = virtual_path.rsplit_once('\\')?;
         let directory_lower = directory.to_lowercase();
         let name_lower = name.to_lowercase();
         let folder_range = equal_range(&self.folders_by_lower_path, |&folder| {
-            self.catalog.folders[folder as usize]
-                .virtual_path_lower
-                .as_ref()
+            folders[folder as usize]
+                .virtual_path_lower()
                 .cmp(directory_lower.as_str())
         });
         let mut first = None;
         let mut exact = None;
         for &folder_id in &self.folders_by_lower_path[folder_range] {
-            let folder = &self.catalog.folders[folder_id as usize];
-            let files = &self.resolve_files[folder.files.start as usize..folder.files.end as usize];
-            let file_range = equal_range(files, |&file| {
-                self.catalog.files[file as usize]
-                    .name_lower
-                    .as_ref()
-                    .cmp(name_lower.as_str())
+            let folder = &folders[folder_id as usize];
+            let range = folder.file_range();
+            let candidates = &self.resolve_files[range.start as usize..range.end as usize];
+            let file_range = equal_range(candidates, |&file| {
+                files[file as usize].name_lower().cmp(name_lower.as_str())
             });
-            for &file_id in &files[file_range] {
+            for &file_id in &candidates[file_range] {
                 first.get_or_insert((folder_id, file_id));
-                let file = &self.catalog.files[file_id as usize];
-                if folder.virtual_path.as_ref() == directory && file.name.as_ref() == name {
+                let file = &files[file_id as usize];
+                if folder.virtual_path() == directory && file.name() == name {
                     exact = Some((folder_id, file_id));
                     break;
                 }
@@ -291,15 +221,15 @@ impl SharesIndex {
             }
         }
         let (folder_id, file_id) = exact.or(first)?;
-        let folder = &self.catalog.folders[folder_id as usize];
-        if folder.buddy_only && !is_buddy {
+        let folder = &folders[folder_id as usize];
+        if folder.buddy_only() && !is_buddy {
             return None;
         }
-        let file = &self.catalog.files[file_id as usize];
+        let file = &files[file_id as usize];
         Some((
-            folder.real_path.join(&file.real_name),
-            file.size,
-            &file.attributes,
+            ShareKey::new(folder.key(), file.key()),
+            file.size(),
+            file.attributes(),
         ))
     }
 
@@ -352,6 +282,8 @@ impl SharesIndex {
             .filter_map(|word| self.postings(word))
             .collect();
 
+        let folders = self.catalog.folders();
+        let files = self.catalog.all_files();
         let mut results = Vec::new();
         let mut path_lower = String::new();
         for file_id in self.posting_files(seed) {
@@ -365,16 +297,16 @@ impl SharesIndex {
             {
                 continue;
             }
-            let folder = &self.catalog.folders[self.folder_for_file(file_id) as usize];
-            if !is_buddy && folder.buddy_only {
+            let folder = &folders[self.folder_for_file(file_id) as usize];
+            if !is_buddy && folder.buddy_only() {
                 continue;
             }
-            let file = &self.catalog.files[file_id as usize];
+            let file = &files[file_id as usize];
             if !excluded_phrases.is_empty() {
                 path_lower.clear();
-                path_lower.push_str(&folder.virtual_path_lower);
+                path_lower.push_str(folder.virtual_path_lower());
                 path_lower.push('\\');
-                path_lower.push_str(&file.name_lower);
+                path_lower.push_str(file.name_lower());
                 if excluded_phrases
                     .iter()
                     .any(|phrase| path_lower.contains(phrase.as_str()))
@@ -383,9 +315,9 @@ impl SharesIndex {
                 }
             }
             results.push(FileInfo {
-                name: format!("{}\\{}", folder.virtual_path, file.name),
-                size: file.size,
-                attributes: file.attributes.clone(),
+                name: format!("{}\\{}", folder.virtual_path(), file.name()),
+                size: file.size(),
+                attributes: file.attributes().clone(),
             });
             if results.len() == max_results {
                 break;
@@ -402,11 +334,12 @@ impl SharesIndex {
     }
 
     fn posting_len(&self, postings: &WordPostings) -> usize {
+        let folders = self.catalog.folders();
         postings.files.len()
             + postings
                 .folders
                 .iter()
-                .map(|&folder| self.catalog.folders[folder as usize].files.len())
+                .map(|&folder| folders[folder as usize].file_range().len())
                 .sum::<usize>()
     }
 
@@ -419,6 +352,7 @@ impl SharesIndex {
     }
 
     fn posting_files<'a>(&'a self, postings: &'a WordPostings) -> impl Iterator<Item = u32> + 'a {
+        let folders = self.catalog.folders();
         let mut next_file = 0usize;
         let mut next_folder = 0usize;
         let mut folder_files: Option<Range<u32>> = None;
@@ -426,7 +360,7 @@ impl SharesIndex {
             if folder_files.as_ref().is_none_or(Range::is_empty) {
                 folder_files = postings.folders.get(next_folder).map(|&folder| {
                     next_folder += 1;
-                    self.catalog.folders[folder as usize].files.clone()
+                    folders[folder as usize].file_range()
                 });
             }
             let from_file = postings.files.get(next_file).copied();
@@ -468,17 +402,17 @@ impl SharesIndex {
         files
     }
 
-    fn folder_view(&self, folder: &ShareCatalogFolder) -> FolderContents {
+    fn folder_view(&self, folder: &CatalogFolder) -> FolderContents {
         FolderContents {
-            directory: folder.virtual_path.to_string(),
-            files: folder
-                .files
-                .clone()
-                .map(|file| &self.catalog.files[file as usize])
+            directory: folder.virtual_path().to_owned(),
+            files: self
+                .catalog
+                .files(folder)
+                .iter()
                 .map(|file| FileInfo {
-                    name: file.name.to_string(),
-                    size: file.size,
-                    attributes: file.attributes.clone(),
+                    name: file.name().to_owned(),
+                    size: file.size(),
+                    attributes: file.attributes().clone(),
                 })
                 .collect(),
         }
@@ -486,8 +420,8 @@ impl SharesIndex {
 
     fn folder_for_file(&self, file_id: u32) -> u32 {
         self.catalog
-            .folders
-            .partition_point(|folder| folder.files.end <= file_id) as u32
+            .folders()
+            .partition_point(|folder| folder.file_range().end <= file_id) as u32
     }
 }
 
@@ -498,26 +432,91 @@ fn equal_range<T>(slice: &[T], mut compare: impl FnMut(&T) -> std::cmp::Ordering
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use std::io;
+
     use super::*;
+    use crate::storage::{CatalogFile, OpenedShare, ScanError, ScanProgress};
+    use crate::types::{BoxFuture, DEFAULT_MAX_SEARCH_RESULTS, DEFAULT_MIN_SEARCH_CHARS};
+
+    pub(crate) struct NoSource;
+
+    impl ShareSource for NoSource {
+        fn load(&self) -> BoxFuture<Result<Option<ShareCatalog>, ScanError>> {
+            unreachable!("index tests never load")
+        }
+
+        fn scan(&self, _: ScanProgress) -> BoxFuture<Result<ShareCatalog, ScanError>> {
+            unreachable!("index tests never scan")
+        }
+
+        fn size(&self, _: ShareKey) -> BoxFuture<io::Result<u64>> {
+            unreachable!("index tests never read files")
+        }
+
+        fn open(&self, _: ShareKey, _: u64) -> BoxFuture<io::Result<OpenedShare>> {
+            unreachable!("index tests never read files")
+        }
+    }
+
+    pub(crate) fn file(name: &str, size: u64) -> CatalogFile {
+        CatalogFile::new(
+            name.into(),
+            name.as_bytes().to_vec(),
+            size,
+            0,
+            FileAttributes::default(),
+        )
+    }
+
+    pub(crate) fn index_of(folders: Vec<(&str, bool, Vec<CatalogFile>)>) -> SharesIndex {
+        let mut catalog = ShareCatalog::new();
+        for (virtual_path, buddy_only, files) in folders {
+            catalog
+                .push_folder(
+                    virtual_path.into(),
+                    format!("/{}", virtual_path.replace('\\', "/")).into_bytes(),
+                    buddy_only,
+                    files,
+                )
+                .unwrap();
+        }
+        SharesIndex::from_catalog(Arc::new(catalog), Arc::new(NoSource)).unwrap()
+    }
 
     fn index(names: &[&str]) -> SharesIndex {
-        let mut catalog = ShareCatalog::empty();
-        catalog.push_folder(
-            "Music\\Caf\u{e9}".into(),
-            PathBuf::from("/music"),
+        index_of(vec![(
+            "Music\\Caf\u{e9}",
             false,
-            names.iter().map(|name| {
-                ShareCatalogFile::new(
-                    name.to_string(),
-                    name.into(),
-                    1,
-                    0,
-                    FileAttributes::default(),
-                )
-            }),
-        );
-        SharesIndex::from_catalog(catalog)
+            names.iter().map(|name| file(name, 1)).collect(),
+        )])
+    }
+
+    fn sample_index() -> SharesIndex {
+        index_of(vec![
+            ("Public", false, Vec::new()),
+            (
+                "Public\\Sample Album",
+                false,
+                vec![file("First Song.flac", 300), file("Second Tune.ogg", 300)],
+            ),
+            ("Private", true, vec![file("hidden song.wav", 300)]),
+        ])
+    }
+
+    fn search(
+        index: &SharesIndex,
+        term: &str,
+        is_buddy: bool,
+        phrases: &[String],
+    ) -> Vec<FileInfo> {
+        index.search(
+            term,
+            is_buddy,
+            phrases,
+            DEFAULT_MAX_SEARCH_RESULTS,
+            DEFAULT_MIN_SEARCH_CHARS,
+        )
     }
 
     fn names(results: Vec<FileInfo>) -> Vec<String> {
@@ -554,5 +553,182 @@ mod tests {
             names(index.search("caf\u{e9}\u{2014}tunes", false, &[], 10, 1)),
             ["Music\\Caf\u{e9}\\caf\u{e9}_tunes.mp3"]
         );
+    }
+
+    #[test]
+    fn search_word_matching() {
+        let index = sample_index();
+
+        let results = search(&index, "sample first", false, &[]);
+        assert_eq!(names(results), ["Public\\Sample Album\\First Song.flac"]);
+        assert!(search(&index, "sample missing", false, &[]).is_empty());
+        assert_eq!(
+            names(search(&index, "sample -tune", false, &[])),
+            ["Public\\Sample Album\\First Song.flac"]
+        );
+        assert_eq!(
+            names(search(&index, "sample *une", false, &[])),
+            ["Public\\Sample Album\\Second Tune.ogg"]
+        );
+        assert_eq!(search(&index, "SAMPLE ALBUM", false, &[]).len(), 2);
+        assert!(search(&index, "ab", false, &[]).is_empty());
+    }
+
+    #[test]
+    fn search_respects_permissions_and_phrases() {
+        let index = sample_index();
+
+        assert!(search(&index, "hidden song", false, &[]).is_empty());
+        assert_eq!(
+            names(search(&index, "hidden song", true, &[])),
+            ["Private\\hidden song.wav"]
+        );
+        assert!(search(&index, "first song", false, &["first".into()]).is_empty());
+    }
+
+    #[test]
+    fn case_colliding_paths_resolve_exact_case_first() {
+        let index = index_of(vec![
+            ("Music", false, Vec::new()),
+            (
+                "Music\\moe shop - pure",
+                false,
+                vec![file("Crush.mp3", 200)],
+            ),
+            (
+                "Music\\Moe Shop - Pure",
+                false,
+                vec![file("Crush.mp3", 300)],
+            ),
+        ]);
+
+        let (key, size, _) = index
+            .resolve("Music\\Moe Shop - Pure\\Crush.mp3", false)
+            .unwrap();
+        assert_eq!(size, 300);
+        assert_eq!(
+            key,
+            ShareKey::new(&b"/Music/Moe Shop - Pure"[..], &b"Crush.mp3"[..])
+        );
+        let (_, size, _) = index
+            .resolve("Music\\moe shop - pure\\Crush.mp3", false)
+            .unwrap();
+        assert_eq!(size, 200);
+        assert!(
+            index
+                .resolve("MUSIC\\MOE SHOP - PURE\\CRUSH.MP3", false)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn browse_and_resolve() {
+        let index = sample_index();
+
+        assert!(
+            index
+                .browse(false)
+                .iter()
+                .all(|folder| !folder.directory.starts_with("Private"))
+        );
+        assert!(
+            index
+                .browse(true)
+                .iter()
+                .any(|folder| folder.directory == "Private")
+        );
+        let (_, size, _) = index
+            .resolve("public\\sample album\\FIRST SONG.FLAC", false)
+            .expect("case-insensitive resolve");
+        assert_eq!(size, 300);
+        assert!(index.resolve("Private\\hidden song.wav", false).is_none());
+        assert!(index.resolve("Private\\hidden song.wav", true).is_some());
+        assert_eq!(
+            index.folder_contents("Public\\Sample Album", false).len(),
+            1
+        );
+        assert!(index.folder_contents("Private", false).is_empty());
+        assert!(index.folder_contents("Nope", true).is_empty());
+    }
+
+    #[test]
+    fn streaming_browse_matches_peer_message_encoding() {
+        let index = sample_index();
+        for is_buddy in [false, true] {
+            let expected = crate::protocol::PeerMessage::SharedFileListResponse {
+                shares: index.browse(is_buddy),
+                unknown: 0,
+                private_shares: Vec::new(),
+            };
+            let bytes = index.browse_frame(is_buddy);
+            assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 5);
+            let parsed = crate::protocol::PeerMessage::parse(5, &bytes[8..]).unwrap();
+            assert_eq!(parsed, expected);
+        }
+    }
+
+    #[test]
+    fn search_skips_trailing_empty_folder() {
+        let index = index_of(vec![
+            ("Music", false, vec![file("song.flac", 300)]),
+            ("Music\\Albums", false, Vec::new()),
+        ]);
+
+        assert_eq!(
+            names(search(&index, "music", false, &[])),
+            vec!["Music\\song.flac"]
+        );
+    }
+
+    #[test]
+    fn search_merges_folder_and_file_postings() {
+        let index = index_of(vec![
+            ("Music", false, vec![file("Sample Loose.mp3", 300)]),
+            (
+                "Music\\Sample",
+                false,
+                vec![file("Sample.flac", 300), file("Other.flac", 300)],
+            ),
+        ]);
+
+        assert_eq!(
+            names(search(&index, "sample", false, &[])),
+            vec![
+                "Music\\Sample Loose.mp3",
+                "Music\\Sample\\Other.flac",
+                "Music\\Sample\\Sample.flac",
+            ]
+        );
+        assert_eq!(
+            names(search(&index, "sample other", false, &[])),
+            vec!["Music\\Sample\\Other.flac"]
+        );
+        assert_eq!(
+            names(search(&index, "sample -other", false, &[])),
+            vec!["Music\\Sample Loose.mp3", "Music\\Sample\\Sample.flac"]
+        );
+        assert_eq!(
+            names(search(&index, "sample *ose", false, &[])),
+            vec!["Music\\Sample Loose.mp3"]
+        );
+        assert_eq!(
+            names(search(&index, "sample", false, &["sample\\other".into()])),
+            vec!["Music\\Sample Loose.mp3", "Music\\Sample\\Sample.flac"]
+        );
+        assert_eq!(index.search("sample", false, &[], 2, 1).len(), 2);
+    }
+
+    #[test]
+    fn duplicate_virtual_folders_are_refused() {
+        let mut catalog = ShareCatalog::new();
+        for _ in 0..2 {
+            catalog
+                .push_folder("Music".into(), Vec::new(), false, Vec::new())
+                .unwrap();
+        }
+        assert!(matches!(
+            SharesIndex::from_catalog(Arc::new(catalog), Arc::new(NoSource)),
+            Err(CatalogError::DuplicateFolder(path)) if path == "Music"
+        ));
     }
 }

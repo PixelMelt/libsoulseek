@@ -225,10 +225,9 @@ impl ClientActor {
             TransferDirection::Download => self
                 .downloads
                 .handle_file_transfer_init(username, token, conn_id),
-            TransferDirection::Upload => {
-                self.uploads
-                    .handle_file_transfer_init(username, token, conn_id, &self.users)
-            }
+            TransferDirection::Upload => self
+                .uploads
+                .handle_file_transfer_init(username, token, conn_id),
         };
         self.emit_transfers(updates);
     }

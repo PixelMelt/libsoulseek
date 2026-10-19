@@ -1,6 +1,5 @@
-use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tracing::{debug, info};
@@ -9,27 +8,47 @@ use super::queue::UploadQueue;
 use super::registry::{Registry, TransferKey};
 use super::speed::SpeedMeter;
 use super::{
-    CONNECTION_CLOSED, CONNECTION_TIMEOUT, LOCAL_FILE_ERROR, TRANSFER_REQUEST_TIMEOUT, TransferIds,
-    TransferPhase, TransferRejectReason, USER_OFFLINE, peer_reason,
+    CONNECTION_CLOSED, CONNECTION_TIMEOUT, LOCAL_FILE_ERROR, StorageDone, StorageSender,
+    TRANSFER_REQUEST_TIMEOUT, TransferIds, TransferPhase, TransferRejectReason, USER_OFFLINE,
+    peer_reason, spawn_storage,
 };
 use crate::client::shares::SharesIndex;
 use crate::client::users::Users;
 use crate::client::{AbortResult, TransferWork};
-use crate::network::ConnId;
-use crate::network::{NetworkCommand, NetworkHandle};
+use crate::network::{ConnId, NetworkCommand, NetworkHandle, OpenUpload};
 use crate::protocol::{PeerMessage, ServerRequest, increment_token, initial_token};
+use crate::storage::{ShareKey, ShareSource};
 use crate::types::{
     FileAttributes, Restriction, TransferDirection, TransferId, TransferSnapshot, TransferStatus,
 };
 
 const TIMED_OUT_RETRY_INTERVAL: Duration = Duration::from_secs(180);
 
-#[derive(Debug)]
+fn resolve(
+    shares: &SharesIndex,
+    virtual_path: &str,
+    is_buddy: bool,
+) -> Option<(Shared, u64, FileAttributes)> {
+    let (key, size, attributes) = shares.resolve(virtual_path, is_buddy)?;
+    let shared = Shared {
+        source: shares.source().clone(),
+        key,
+    };
+    Some((shared, size, attributes.clone()))
+}
+
+#[derive(Clone)]
+struct Shared {
+    source: Arc<dyn ShareSource>,
+    key: ShareKey,
+}
+
 struct UploadTransfer {
     id: TransferId,
     username: String,
     virtual_path: String,
-    real_path: Option<PathBuf>,
+    shared: Option<Shared>,
+    file_path: Option<String>,
     size: u64,
     attributes: FileAttributes,
     phase: TransferPhase,
@@ -44,7 +63,8 @@ impl UploadTransfer {
     fn new(
         id: TransferId,
         key: TransferKey,
-        real_path: Option<PathBuf>,
+        shared: Option<Shared>,
+        file_path: Option<String>,
         size: u64,
         attributes: FileAttributes,
     ) -> Self {
@@ -52,7 +72,8 @@ impl UploadTransfer {
             id,
             username: key.0,
             virtual_path: key.1,
-            real_path,
+            shared,
+            file_path,
             size,
             attributes,
             phase: TransferPhase::Queued,
@@ -74,7 +95,7 @@ impl UploadTransfer {
             direction: TransferDirection::Upload,
             username: self.username.clone(),
             virtual_path: self.virtual_path.clone(),
-            folder_path: None,
+            destination: None,
             size: self.size,
             bytes_done: self.bytes_done,
             status: self.phase.status(),
@@ -82,10 +103,7 @@ impl UploadTransfer {
                 TransferPhase::Failed(reason) => Some(reason.clone()),
                 _ => None,
             },
-            file_path: self
-                .real_path
-                .as_ref()
-                .map(|path| path.display().to_string()),
+            file_path: self.file_path.clone(),
             queue_place: 0,
             speed_bps: if self.phase == TransferPhase::Transferring {
                 self.speed.bps()
@@ -99,6 +117,7 @@ impl UploadTransfer {
 
 pub(in crate::client) struct Uploads {
     net: NetworkHandle,
+    storage: StorageSender,
     upload_slots: usize,
     queue_file_limit: usize,
     queue_size_limit_mb: u64,
@@ -114,6 +133,7 @@ pub(in crate::client) struct Uploads {
 impl Uploads {
     pub fn new(
         net: NetworkHandle,
+        storage: StorageSender,
         upload_slots: usize,
         queue_file_limit: usize,
         queue_size_limit_mb: u64,
@@ -121,6 +141,7 @@ impl Uploads {
     ) -> Self {
         Self {
             net,
+            storage,
             upload_slots,
             queue_file_limit,
             queue_size_limit_mb,
@@ -183,7 +204,8 @@ impl Uploads {
         let mut transfer = UploadTransfer::new(
             seed.id,
             key.clone(),
-            seed.file_path.map(PathBuf::from),
+            None,
+            seed.file_path,
             seed.size,
             seed.attributes,
         );
@@ -226,8 +248,8 @@ impl Uploads {
         }
         let accepted = admission.is_ok();
         let mut updates = Vec::new();
-        if let Ok(Some((real_path, size, attributes))) = admission {
-            updates = self.enqueue(ids, key, real_path, size, attributes);
+        if let Ok(Some((shared, size, attributes))) = admission {
+            updates = self.enqueue(ids, key, shared, size, attributes);
             updates.extend(self.check_queue(users));
         }
         (updates, accepted)
@@ -252,7 +274,7 @@ impl Uploads {
         virtual_path: &str,
         shares: Option<&SharesIndex>,
         users: &Users,
-    ) -> Result<Option<(PathBuf, u64, FileAttributes)>, String> {
+    ) -> Result<Option<(Shared, u64, FileAttributes)>, String> {
         if let Some(reason) = self.refusal(username, virtual_path, users) {
             return Err(reason);
         }
@@ -265,8 +287,8 @@ impl Uploads {
             debug!(username, virtual_path, "upload already queued");
             return Ok(None);
         }
-        let (real_path, size, attributes) = shares
-            .and_then(|shares| shares.resolve(virtual_path, users.is_buddy(username)))
+        let (shared, size, attributes) = shares
+            .and_then(|shares| resolve(shares, virtual_path, users.is_buddy(username)))
             .ok_or(TransferRejectReason::FILE_NOT_SHARED)?;
         if self.queue.queued_for(username) >= self.queue_file_limit {
             return Err(TransferRejectReason::TOO_MANY_FILES.into());
@@ -276,7 +298,7 @@ impl Uploads {
         {
             return Err(TransferRejectReason::TOO_MANY_MEGABYTES.into());
         }
-        Ok(Some((real_path, size, attributes.clone())))
+        Ok(Some((shared, size, attributes)))
     }
 
     fn queued_bytes_for(&self, username: &str) -> u64 {
@@ -293,7 +315,7 @@ impl Uploads {
         &mut self,
         ids: &mut TransferIds,
         key: TransferKey,
-        real_path: PathBuf,
+        shared: Shared,
         size: u64,
         attributes: FileAttributes,
     ) -> Vec<TransferWork> {
@@ -301,7 +323,9 @@ impl Uploads {
             Some(existing) => existing.id,
             None => ids.mint(),
         };
-        let transfer = UploadTransfer::new(id, key.clone(), Some(real_path), size, attributes);
+        let file_path = Some(shared.key.to_string());
+        let transfer =
+            UploadTransfer::new(id, key.clone(), Some(shared), file_path, size, attributes);
         let queued = TransferWork::Update(transfer.snapshot());
         self.transfers.insert(id, key.clone(), transfer);
         self.queue.push(key);
@@ -353,12 +377,24 @@ impl Uploads {
     }
 
     pub fn revalidate(&mut self, shares: &SharesIndex, users: &Users) -> Vec<TransferWork> {
-        let unshared = self.transfers.keys_where(|transfer| {
-            transfer.phase.is_active()
-                && shares
-                    .resolve(&transfer.virtual_path, users.is_buddy(&transfer.username))
-                    .is_none_or(|(real_path, _, _)| transfer.real_path.as_ref() != Some(&real_path))
-        });
+        let active = self
+            .transfers
+            .keys_where(|transfer| transfer.phase.is_active());
+        let mut unshared = Vec::new();
+        for key in active {
+            let transfer = self.transfers.get_mut(&key).unwrap();
+            let resolved = resolve(
+                shares,
+                &transfer.virtual_path,
+                users.is_buddy(&transfer.username),
+            );
+            match (resolved, &mut transfer.shared) {
+                (Some((resolved, _, _)), Some(current)) if resolved.key == current.key => {
+                    current.source = resolved.source;
+                }
+                _ => unshared.push(key),
+            }
+        }
         self.fail_each(
             &unshared,
             TransferRejectReason::FILE_NOT_SHARED,
@@ -408,27 +444,60 @@ impl Uploads {
     }
 
     fn activate(&mut self, key: &TransferKey) -> Vec<TransferWork> {
-        let real_path = self
-            .transfers
-            .get(key)
-            .unwrap()
-            .real_path
-            .as_ref()
-            .expect("upload queued without a resolved path");
-        let size = match fs::metadata(real_path) {
-            Ok(metadata) => metadata.len(),
-            Err(error) => {
-                self.deny(key, TransferRejectReason::FILE_READ_ERROR);
-                return self.fail(key, format!("{LOCAL_FILE_ERROR}: {error}"));
-            }
-        };
         self.token = increment_token(self.token);
         let token = self.token;
         self.queue.mark_active(key, token);
         self.transfers.attach_token(key, token);
         let transfer = self.transfers.get_mut(key).unwrap();
-        transfer.size = size;
         transfer.phase = TransferPhase::GettingStatus;
+        transfer.activated_at = Some(Instant::now());
+        let shared = transfer
+            .shared
+            .clone()
+            .expect("upload queued without a shared file");
+        let sizing = key.clone();
+        spawn_storage(
+            &self.storage,
+            shared.source.size(shared.key),
+            move |result| StorageDone::Sized {
+                key: sizing,
+                token,
+                result: result.unwrap_or_else(|error| Err(io::Error::other(error))),
+            },
+        );
+        Vec::new()
+    }
+
+    pub fn handle_sized(
+        &mut self,
+        key: &TransferKey,
+        token: u32,
+        result: io::Result<u64>,
+        users: &Users,
+    ) -> Vec<TransferWork> {
+        let current = self.transfers.key_by_token(&key.0, token) == Some(key)
+            && self.transfers.conn_of(key).is_none()
+            && self.transfers.get(key).unwrap().phase == TransferPhase::GettingStatus;
+        if !current {
+            debug!(
+                username = key.0,
+                virtual_path = key.1,
+                token,
+                "file size for an upload that moved on"
+            );
+            return Vec::new();
+        }
+        let size = match result {
+            Ok(size) => size,
+            Err(error) => {
+                self.deny(key, TransferRejectReason::FILE_READ_ERROR);
+                let mut updates = self.fail(key, format!("{LOCAL_FILE_ERROR}: {error}"));
+                updates.extend(self.check_queue(users));
+                return updates;
+            }
+        };
+        let transfer = self.transfers.get_mut(key).unwrap();
+        transfer.size = size;
         transfer.activated_at = Some(Instant::now());
         let activated = TransferWork::Update(transfer.snapshot());
         info!(
@@ -488,7 +557,6 @@ impl Uploads {
         username: &str,
         token: u32,
         conn_id: ConnId,
-        users: &Users,
     ) -> Vec<TransferWork> {
         let Some(key) = self.transfers.key_by_token(username, token).cloned() else {
             self.net.send(NetworkCommand::CloseConnection(conn_id));
@@ -501,42 +569,38 @@ impl Uploads {
         self.transfers.attach_conn(&key, conn_id);
         let transfer = self.transfers.get_mut(&key).unwrap();
         transfer.activated_at = None;
-
-        let real_path = transfer
-            .real_path
-            .as_ref()
-            .expect("upload activated without a resolved path");
+        transfer.phase = TransferPhase::Transferring;
+        transfer.started_at = Some(Instant::now());
+        transfer.speed.reset();
         let size = transfer.size;
-        let opened = fs::File::open(real_path).and_then(|file| {
-            let current = file.metadata()?.len();
-            if current == size {
-                Ok(file)
-            } else {
-                Err(io::Error::other(format!(
-                    "file changed size from {size} to {current} bytes"
-                )))
-            }
+        let shared = transfer
+            .shared
+            .clone()
+            .expect("upload activated without a shared file");
+        let started = TransferWork::Update(transfer.snapshot());
+        info!(username, virtual_path = key.1, size, "upload started");
+        let open = OpenUpload::new(move |offset| {
+            Box::pin(async move {
+                let opened = shared
+                    .source
+                    .open(shared.key, offset)
+                    .await
+                    .map_err(|error| io::Error::other(format!("{LOCAL_FILE_ERROR}: {error}")))?;
+                if opened.size != size {
+                    return Err(io::Error::other(format!(
+                        "{LOCAL_FILE_ERROR}: file changed size from {size} to {} bytes",
+                        opened.size
+                    )));
+                }
+                Ok(opened.reader)
+            })
         });
-        match opened {
-            Ok(file) => {
-                transfer.phase = TransferPhase::Transferring;
-                transfer.started_at = Some(Instant::now());
-                transfer.speed.reset();
-                let started = TransferWork::Update(transfer.snapshot());
-                info!(username, virtual_path = key.1, size, "upload started");
-                self.net.send(NetworkCommand::UploadFile {
-                    conn_id,
-                    file,
-                    size,
-                });
-                vec![started]
-            }
-            Err(error) => {
-                let mut updates = self.fail_notified(&key, format!("{LOCAL_FILE_ERROR}: {error}"));
-                updates.extend(self.check_queue(users));
-                updates
-            }
-        }
+        self.net.send(NetworkCommand::UploadFile {
+            conn_id,
+            open,
+            size,
+        });
+        vec![started]
     }
 
     pub fn handle_upload_progress(
@@ -738,13 +802,12 @@ impl Uploads {
             if self.refusal(&key.0, &key.1, users).is_some() {
                 continue;
             }
-            let Some((real_path, size, attributes)) =
-                shares.and_then(|shares| shares.resolve(&key.1, users.is_buddy(&key.0)))
+            let Some((shared, size, attributes)) =
+                shares.and_then(|shares| resolve(shares, &key.1, users.is_buddy(&key.0)))
             else {
                 continue;
             };
-            let attributes = attributes.clone();
-            updates.extend(self.enqueue(ids, key, real_path, size, attributes));
+            updates.extend(self.enqueue(ids, key, shared, size, attributes));
         }
         updates
     }
@@ -813,36 +876,48 @@ impl Uploads {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::path::PathBuf;
 
     use super::*;
-    use crate::client::shares::{self, ShareCatalog};
-    use crate::network::{NetworkEvent, spawn as spawn_network};
-    use crate::types::SharedFolder;
+    use crate::storage::{CatalogFile, LocalShares, ShareCatalog};
     use tokio::sync::mpsc;
 
     const TRACKS: [&str; 3] = ["Music\\a.mp3", "Music\\b.mp3", "Music\\c.mp3"];
     const CONN: ConnId = 7;
+    const PAYLOAD: &[u8] = b"payload";
 
     fn shares_of(tag: &str, names: &[&str]) -> SharesIndex {
         let dir = std::env::temp_dir().join(format!("soulseek-{tag}-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         for name in names {
-            std::fs::write(dir.join(name), b"payload").unwrap();
+            std::fs::write(dir.join(name), PAYLOAD).unwrap();
         }
-        let catalog = shares::walk(
-            &[SharedFolder {
-                virtual_name: "Music".into(),
-                path: dir,
-                buddy_only: false,
-            }],
-            &[],
-            &ShareCatalog::empty(),
-            &std::sync::atomic::AtomicBool::new(false),
-            &|_| {},
-        )
-        .expect("scan test shares");
-        SharesIndex::from_catalog(catalog)
+        let source: Arc<dyn ShareSource> =
+            Arc::new(LocalShares::new(Vec::new(), Vec::new(), dir.join("catalog.gz")).unwrap());
+        let mut catalog = ShareCatalog::new();
+        catalog
+            .push_folder(
+                "Music".into(),
+                dir.into_os_string().into_vec(),
+                false,
+                names
+                    .iter()
+                    .map(|name| {
+                        CatalogFile::new(
+                            (*name).to_owned(),
+                            name.as_bytes().to_vec(),
+                            PAYLOAD.len() as u64,
+                            0,
+                            FileAttributes::default(),
+                        )
+                    })
+                    .collect(),
+            )
+            .unwrap();
+        SharesIndex::from_catalog(Arc::new(catalog), source).unwrap()
     }
 
     struct Harness {
@@ -850,32 +925,60 @@ mod tests {
         ids: TransferIds,
         shares: SharesIndex,
         users: Users,
-        _events: mpsc::Receiver<NetworkEvent>,
+        commands: mpsc::Receiver<NetworkCommand>,
+        storage: mpsc::UnboundedReceiver<StorageDone>,
     }
 
     impl Harness {
         fn new(tag: &str, slots: usize) -> Self {
-            let (net, _events) = spawn_network();
-            let mut uploads = Uploads::new(net, slots, 500, 0, "Banned".into());
+            let (net, commands) = crate::network::test_channel();
+            let (storage_tx, storage) = mpsc::unbounded_channel();
+            let mut uploads = Uploads::new(net, storage_tx, slots, 500, 0, "Banned".into());
             uploads.suspended = false;
             Self {
                 uploads,
                 ids: TransferIds::new(&[]),
                 shares: shares_of(tag, &["a.mp3", "b.mp3", "c.mp3"]),
                 users: Users::new(HashSet::new(), HashSet::new(), HashSet::new(), Vec::new()),
-                _events,
+                commands,
+                storage,
             }
         }
 
-        fn transferring(tag: &str) -> (Self, u32, u64) {
+        async fn settle(&mut self) -> Vec<TransferWork> {
+            let done = tokio::time::timeout(Duration::from_secs(10), self.storage.recv())
+                .await
+                .expect("a storage completion")
+                .expect("the storage channel stays open");
+            let StorageDone::Sized { key, token, result } = done else {
+                unreachable!("uploads only size files");
+            };
+            self.uploads.handle_sized(&key, token, result, &self.users)
+        }
+
+        async fn transferring(tag: &str) -> (Self, u32, u64) {
             let mut harness = Self::new(tag, 999);
             harness.queue("peer", TRACKS[0]);
+            assert_eq!(harness.settle().await.len(), 1);
             let token = harness.uploads.token;
             harness
                 .uploads
-                .handle_file_transfer_init("peer", token, CONN, &harness.users);
+                .handle_file_transfer_init("peer", token, CONN);
             let size = harness.transfer("peer", TRACKS[0]).size;
             (harness, token, size)
+        }
+
+        fn path_of(&self, username: &str, path: &str) -> PathBuf {
+            let key = &self.transfer(username, path).shared.as_ref().unwrap().key;
+            PathBuf::from(OsStr::from_bytes(key.folder())).join(OsStr::from_bytes(key.file()))
+        }
+
+        fn drain(&mut self) -> Vec<NetworkCommand> {
+            let mut commands = Vec::new();
+            while let Ok(command) = self.commands.try_recv() {
+                commands.push(command);
+            }
+            commands
         }
 
         fn request(&mut self, username: &str, path: &str) -> (Vec<TransferWork>, bool) {
@@ -1054,7 +1157,7 @@ mod tests {
     #[tokio::test]
     async fn only_bytes_sent_past_the_resume_offset_are_a_delivery() {
         for tag in ["resume-end", "resume-mid", "resume-past"] {
-            let (mut harness, token, size) = Harness::transferring(tag);
+            let (mut harness, token, size) = Harness::transferring(tag).await;
             let (offset, sent) = match tag {
                 "resume-end" => (size, 0),
                 "resume-mid" => (size / 2, size - size / 2),
@@ -1080,7 +1183,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_duplicate_file_connection_does_not_finish_the_primary_transfer() {
-        let (mut harness, token, size) = Harness::transferring("dup-conn");
+        let (mut harness, token, size) = Harness::transferring("dup-conn").await;
         harness
             .uploads
             .handle_upload_progress("peer", token, 0, size);
@@ -1118,18 +1221,29 @@ mod tests {
         for path in [TRACKS[0], TRACKS[1]] {
             harness.queue("peer", path);
         }
-        let real_path = |path| harness.transfer("peer", path).real_path.clone().unwrap();
-        std::fs::write(real_path(TRACKS[0]), b"a longer payload").unwrap();
-        std::fs::remove_file(real_path(TRACKS[1])).unwrap();
+        std::fs::write(harness.path_of("peer", TRACKS[0]), b"a longer payload").unwrap();
+        std::fs::remove_file(harness.path_of("peer", TRACKS[1])).unwrap();
 
-        assert!(!harness.set_slots(1).is_empty());
-        assert_eq!(harness.transfer("peer", TRACKS[0]).size, 16);
+        assert!(harness.set_slots(1).is_empty());
         assert_eq!(
             harness.phase("peer", TRACKS[0]),
             TransferPhase::GettingStatus
         );
+        assert_eq!(harness.settle().await.len(), 1);
+        assert_eq!(harness.transfer("peer", TRACKS[0]).size, 16);
+        assert!(harness.drain().iter().any(|command| matches!(
+            command,
+            NetworkCommand::SendPeerMessage {
+                message: PeerMessage::TransferRequest {
+                    filesize: Some(16),
+                    ..
+                },
+                ..
+            }
+        )));
 
         harness.abort("peer", TRACKS[0]);
+        harness.settle().await;
         assert!(matches!(
             harness.phase("peer", TRACKS[1]),
             TransferPhase::Failed(reason) if reason.starts_with(LOCAL_FILE_ERROR)
@@ -1137,29 +1251,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_file_changed_after_the_request_is_not_streamed() {
-        let mut harness = Harness::new("changed", 999);
+    async fn a_size_answered_after_an_abort_is_ignored() {
+        let mut harness = Harness::new("late-size", 999);
         harness.queue("peer", TRACKS[0]);
-        let path = harness
-            .transfer("peer", TRACKS[0])
-            .real_path
-            .clone()
-            .unwrap();
-        std::fs::write(&path, b"x").unwrap();
-        let token = harness.uploads.token;
+        harness.abort("peer", TRACKS[0]);
+        harness.drain();
+        assert!(harness.settle().await.is_empty());
+        assert_eq!(harness.phase("peer", TRACKS[0]), TransferPhase::Aborted);
+        assert!(harness.drain().iter().all(|command| !matches!(
+            command,
+            NetworkCommand::SendPeerMessage {
+                message: PeerMessage::TransferRequest { .. },
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn a_file_changed_after_the_request_is_not_streamed() {
+        let (mut harness, token, _) = Harness::transferring("changed").await;
+        std::fs::write(harness.path_of("peer", TRACKS[0]), b"x").unwrap();
+        let open = harness
+            .drain()
+            .into_iter()
+            .find_map(|command| match command {
+                NetworkCommand::UploadFile { open, .. } => Some(open),
+                _ => None,
+            })
+            .expect("an upload command");
+        let error = open
+            .open(0)
+            .await
+            .err()
+            .expect("a changed file")
+            .to_string();
+        assert!(error.starts_with(LOCAL_FILE_ERROR) && error.contains("changed size"));
+
         harness
             .uploads
-            .handle_file_transfer_init("peer", token, CONN, &harness.users);
-        assert!(matches!(
+            .handle_transfer_error("peer", token, &error, &harness.users);
+        assert_eq!(
             harness.phase("peer", TRACKS[0]),
-            TransferPhase::Failed(reason) if reason.contains("changed size")
-        ));
+            TransferPhase::Failed(error)
+        );
         assert_eq!(harness.conn("peer", TRACKS[0]), None);
     }
 
     #[tokio::test]
     async fn a_transfer_response_after_the_file_connection_is_ignored() {
-        let (mut harness, token, _) = Harness::transferring("late-response");
+        let (mut harness, token, _) = Harness::transferring("late-response").await;
         let work = harness.uploads.handle_transfer_response(
             "peer",
             token,
@@ -1314,6 +1454,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_replacement_source_sharing_the_same_file_takes_over_its_uploads() {
+        let mut harness = Harness::new("swap", 0);
+        harness.queue("peer", TRACKS[0]);
+        let replacement = shares_of("swap", &["a.mp3"]);
+        assert!(
+            harness
+                .uploads
+                .revalidate(&replacement, &harness.users)
+                .is_empty()
+        );
+        let shared = harness.transfer("peer", TRACKS[0]).shared.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&shared.source, replacement.source()));
+        assert_eq!(harness.phase("peer", TRACKS[0]), TransferPhase::Queued);
+    }
+
+    #[tokio::test]
     #[should_panic(expected = "seeded without settle_after_restart")]
     async fn an_unsettled_upload_seed_is_refused() {
         let mut harness = Harness::new("unsettled-seed", 2);
@@ -1322,7 +1478,7 @@ mod tests {
             direction: TransferDirection::Upload,
             username: "peer".into(),
             virtual_path: TRACKS[0].into(),
-            folder_path: None,
+            destination: None,
             size: 10,
             bytes_done: 0,
             status: TransferStatus::Queued,
@@ -1332,5 +1488,31 @@ mod tests {
             speed_bps: 0,
             attributes: FileAttributes::default(),
         });
+    }
+
+    #[tokio::test]
+    async fn the_request_timeout_starts_when_the_request_is_sent() {
+        let mut harness = Harness::new("slow-size", 999);
+        harness.queue("peer", TRACKS[0]);
+        let key = ("peer".to_owned(), TRACKS[0].to_owned());
+        harness
+            .uploads
+            .transfers
+            .get_mut(&key)
+            .unwrap()
+            .activated_at =
+            Some(Instant::now() - TRANSFER_REQUEST_TIMEOUT + Duration::from_secs(1));
+        assert_eq!(harness.settle().await.len(), 1);
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(
+            harness
+                .uploads
+                .sweep_request_timeouts(&harness.users)
+                .is_empty()
+        );
+        assert_eq!(
+            harness.phase("peer", TRACKS[0]),
+            TransferPhase::GettingStatus
+        );
     }
 }

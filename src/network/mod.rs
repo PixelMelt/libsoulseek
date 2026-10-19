@@ -5,7 +5,7 @@ mod conn;
 
 use tokio::sync::mpsc;
 
-pub use api::{AllowedResponse, ConnId, NetworkCommand, NetworkEvent};
+pub use api::{AllowedResponse, ConnId, NetworkCommand, NetworkEvent, OpenDownload, OpenUpload};
 
 const COMMAND_QUEUE_CAPACITY: usize = 1024;
 const EVENT_QUEUE_CAPACITY: usize = 4096;

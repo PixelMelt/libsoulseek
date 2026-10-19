@@ -13,6 +13,7 @@ use crate::client::{
     EnqueueResult, RetryResult, SearchScope, TRANSFER_QUEUE_CAPACITY, TransferWork,
 };
 use crate::protocol::{ServerRequest, initial_token};
+use crate::storage::{DownloadStore, ShareSource};
 use crate::types::{
     FileAttributes, Restriction, RuntimeConfig, TransferDirection, TransferId, TransferStatus,
 };
@@ -231,6 +232,15 @@ impl Client {
 
     pub async fn rescan_shares(&self) {
         self.run(|actor| actor.start_scan(ScanJob::RESCAN)).await;
+    }
+
+    pub async fn set_shares(&self, source: Arc<dyn ShareSource>) {
+        self.run(move |actor| actor.set_shares(source)).await;
+    }
+
+    pub async fn set_downloads(&self, store: Arc<dyn DownloadStore>) {
+        self.run(move |actor| actor.downloads.set_store(store))
+            .await;
     }
 
     pub async fn apply_config(&self, config: RuntimeConfig) {

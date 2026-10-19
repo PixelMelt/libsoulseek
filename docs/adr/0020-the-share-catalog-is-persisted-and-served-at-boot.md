@@ -1,6 +1,6 @@
 # 20. The share catalog is persisted and served at boot
 
-Status: Accepted (supersedes ADR 0003 in part, ADR 0017 and ADR 0018; refines newkitine ADR 0033)
+Status: Accepted (supersedes ADR 0003 in part, ADR 0017 and ADR 0018; refines newkitine ADR 0033; refined by ADR 0030)
 Nicotine+: Matches: Nicotine+ persists its share databases, serves them at login, and keeps serving the old list during a rescan
 
 ## Context
@@ -9,7 +9,7 @@ The index was rebuilt from a disk walk at every boot and dropped on every share-
 
 ## Decision
 
-`shares::walk` produces a `ShareCatalog` (folders with canonical real paths and buddy flags; files with names, sizes, mtimes and audio attributes). After every successful walk the catalog is saved to `ClientBootstrap.share_catalog` (postcard under gzip; ADR 0013 covers failure); newkitine keeps it as `share-catalog.gz` next to its config file. Every scan job loads that cache first. When the job has `install_cached` set (boot, and every share-config change) the cached catalog is restricted to the current configuration by `shares::restrict` (a folder survives when its root virtual name is configured and its real path lies under that share's canonical path; the buddy flag comes from the configuration) and installed immediately. When the job walks, the loaded cache is the attribute cache (real path + size + mtime) and the walk's catalog installs when it finishes. The old index keeps serving until a replacement installs. There is no request deferral anywhere: with no index (first run, or an empty cache) requests are answered "File not shared.", exactly like a fresh Nicotine+.
+The `LocalShares` walk produces a `ShareCatalog` (folders keyed by their real paths with buddy flags; files keyed by their real names with sizes, mtimes and audio attributes). After every successful walk the catalog is saved to the cache path `LocalShares` was built with (postcard under gzip; ADR 0013 covers failure); newkitine keeps it as `share-catalog.gz` next to its config file. When the job loads (boot, and every `set_shares`) `LocalShares::load` reads that cache, restricts it to the current configuration (a folder survives when its root virtual name is configured and its real path lies under that share's canonical path; the buddy flag comes from the configuration) and the client installs it immediately. When the job scans, the walk reads the cache file as its attribute cache (real path + size + mtime) and the walk's catalog installs when it finishes. The old index keeps serving until a replacement installs. There is no request deferral anywhere: with no index (first run, or an empty cache) requests are answered "File not shared.", exactly like a fresh Nicotine+.
 
 ## Consequences
 

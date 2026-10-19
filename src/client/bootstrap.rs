@@ -1,11 +1,13 @@
-use std::path::PathBuf;
+use std::sync::Arc;
 
+use crate::storage::{DownloadStore, ShareSource};
 use crate::types::{RuntimeConfig, TransferSnapshot};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ClientBootstrap {
     pub runtime: RuntimeConfig,
-    pub share_catalog: PathBuf,
+    pub shares: Arc<dyn ShareSource>,
+    pub downloads: Arc<dyn DownloadStore>,
     pub scan_on_startup: bool,
     pub connect_on_startup: bool,
     pub buddies: Vec<String>,

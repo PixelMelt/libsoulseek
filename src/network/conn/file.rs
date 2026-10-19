@@ -1,7 +1,6 @@
-use std::io::SeekFrom;
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep, sleep_until, timeout};
@@ -10,8 +9,9 @@ use super::bandwidth::{Bandwidth, Grant};
 use super::{
     ConnControl, ConnEvent, FileEvent, PEER_IDLE_TIMEOUT, SharedLimits, SocketReader, write_all,
 };
-use crate::network::ConnId;
+use crate::network::{ConnId, OpenDownload, OpenUpload};
 use crate::protocol::{FileOffset, FileTransferInit};
+use crate::types::FileWriter;
 
 pub(super) async fn run_file_loop(
     conn_id: ConnId,
@@ -46,17 +46,13 @@ pub(super) async fn run_file_loop(
                             break Some("write failed".into());
                         }
                     }
-                    Some(ConnControl::Download { file, offset, bytes_left }) => {
-                        let offset_bytes = FileOffset { offset }.to_bytes();
-                        if write_all(&mut writer, &offset_bytes).await.is_err() {
-                            break Some("write failed".into());
-                        }
+                    Some(ConnControl::Download { open, size }) => {
                         let task = TransferTask { conn_id, events: &events, control: &mut control, limits: &limits };
-                        break run_download(task, &mut reader, file, bytes_left).await;
+                        break run_download(task, &mut writer, &mut reader, open, size).await;
                     }
-                    Some(ConnControl::Upload { file, size }) => {
+                    Some(ConnControl::Upload { open, size }) => {
                         let task = TransferTask { conn_id, events: &events, control: &mut control, limits: &limits };
-                        break run_upload(task, &mut writer, &mut reader, file, size).await;
+                        break run_upload(task, &mut writer, &mut reader, open, size).await;
                     }
                     Some(ConnControl::Close) | None => break None,
                     Some(other) => unreachable!("invalid file control {other:?}"),
@@ -117,43 +113,80 @@ impl TransferTask<'_> {
 }
 
 async fn run_download(
-    task: TransferTask<'_>,
+    mut task: TransferTask<'_>,
+    writer: &mut BufWriter<OwnedWriteHalf>,
     reader: &mut SocketReader,
-    file: std::fs::File,
-    mut bytes_left: u64,
+    open: OpenDownload,
+    size: u64,
 ) -> Option<String> {
-    let mut file = tokio::fs::File::from_std(file);
+    let (mut file, offset) = match timeout(PEER_IDLE_TIMEOUT, open.open()).await {
+        Ok(Ok(opened)) => opened,
+        Ok(Err(error)) => return task.fail(error).await,
+        Err(_) => return task.fail("opening the download file timed out").await,
+    };
+    let received = match size.checked_sub(offset) {
+        None => Err(task
+            .fail(format!(
+                "partial download holds {offset} bytes of a {size} byte file"
+            ))
+            .await),
+        Some(0) => Ok(()),
+        Some(bytes_left) => receive(&mut task, writer, reader, &mut file, offset, bytes_left).await,
+    };
+    let closed = timeout(PEER_IDLE_TIMEOUT, file.shutdown()).await;
+    match (received, closed) {
+        (Ok(()), Ok(Ok(()))) => {
+            task.report(FileEvent::DownloadProgress { bytes_left: 0 })
+                .await;
+            None
+        }
+        (Ok(()), Ok(Err(error))) => task.fail(error).await,
+        (Ok(()), Err(_)) => task.fail("closing the download file timed out").await,
+        (Err(outcome), _) => outcome,
+    }
+}
+
+async fn receive(
+    task: &mut TransferTask<'_>,
+    writer: &mut BufWriter<OwnedWriteHalf>,
+    reader: &mut SocketReader,
+    file: &mut FileWriter,
+    offset: u64,
+    mut bytes_left: u64,
+) -> Result<(), Option<String>> {
+    if write_all(writer, &FileOffset { offset }.to_bytes())
+        .await
+        .is_err()
+    {
+        return Err(Some("write failed".into()));
+    }
+    task.report(FileEvent::DownloadProgress { bytes_left })
+        .await;
     let mut buffer = vec![0u8; 65536];
     let mut last_report = Instant::now();
     let limit = &task.limits.download;
     let _active = limit.join();
-    let error = loop {
-        if bytes_left == 0 {
-            if let Err(error) = file.flush().await {
-                break task.fail(error).await;
-            }
-            task.report(FileEvent::DownloadProgress { bytes_left: 0 })
-                .await;
-            break None;
-        }
+    while bytes_left > 0 {
         let max_len = bytes_left.min(buffer.len() as u64);
         let Some(grant) = take_turn(limit, task.control, max_len).await else {
-            break None;
+            return Err(None);
         };
         tokio::select! {
             biased;
             ctrl = task.control.recv() => {
                 match ctrl {
-                    Some(ConnControl::Close) | None => break None,
+                    Some(ConnControl::Close) | None => return Err(None),
                     Some(other) => unreachable!("invalid download control {other:?}"),
                 }
             }
             read_result = read_granted(reader, &mut buffer[..grant.len]) => {
                 match read_result {
-                    Ok(0) => break Some("connection closed".into()),
+                    Ok(0) => return Err(Some("connection closed".into())),
                     Ok(count) => {
-                        if let Err(error) = file.write_all(&buffer[..count]).await {
-                            break task.fail(error).await;
+                        match timeout(PEER_IDLE_TIMEOUT, file.write_all(&buffer[..count])).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => return Err(task.fail(error).await),
+                            Err(_) => return Err(task.fail("writing the download file timed out").await),
                         }
                         bytes_left -= count as u64;
                         limit.charge(&grant, count as u64);
@@ -162,14 +195,13 @@ async fn run_download(
                             task.report(FileEvent::DownloadProgress { bytes_left }).await;
                         }
                     }
-                    Err(error) => break Some(error.to_string()),
+                    Err(error) => return Err(Some(error.to_string())),
                 }
             }
-            _ = sleep(PEER_IDLE_TIMEOUT) => break Some("download stalled".into()),
+            _ = sleep(PEER_IDLE_TIMEOUT) => return Err(Some("download stalled".into())),
         }
-    };
-    let _ = file.flush().await;
-    error
+    }
+    Ok(())
 }
 
 const UPLOAD_WRITE_PIECE: usize = 4096;
@@ -190,7 +222,7 @@ async fn run_upload(
     task: TransferTask<'_>,
     writer: &mut BufWriter<OwnedWriteHalf>,
     reader: &mut SocketReader,
-    file: std::fs::File,
+    open: OpenUpload,
     size: u64,
 ) -> Option<String> {
     let offset = tokio::select! {
@@ -205,14 +237,29 @@ async fn run_upload(
         Err(_) => return Some("offset read timed out".into()),
         Ok(Err(error)) => return Some(error.to_string()),
     };
+    if offset > size {
+        return task
+            .fail(format!(
+                "peer requested offset {offset} beyond the {size} byte file"
+            ))
+            .await;
+    }
     let mut bytes_sent = 0u64;
     task.report(FileEvent::UploadProgress { offset, bytes_sent })
         .await;
 
-    let mut file = tokio::fs::File::from_std(file);
-    if let Err(error) = file.seek(SeekFrom::Start(offset)).await {
-        return task.fail(error).await;
-    }
+    let opened = tokio::select! {
+        ctrl = task.control.recv() => match ctrl {
+            Some(ConnControl::Close) | None => return None,
+            Some(other) => unreachable!("invalid upload control {other:?}"),
+        },
+        opened = timeout(PEER_IDLE_TIMEOUT, open.open(offset)) => opened,
+    };
+    let mut file = match opened {
+        Ok(Ok(file)) => file,
+        Ok(Err(error)) => return task.fail(error).await,
+        Err(_) => return task.fail("opening the shared file timed out").await,
+    };
 
     let mut buffer = vec![0u8; 65536];
     let mut last_report = Instant::now();
@@ -226,10 +273,11 @@ async fn run_upload(
         }
         let max_len = (size - offset - bytes_sent).min(buffer.len() as u64);
         let grant = take_turn(limit, task.control, max_len).await?;
-        let count = match file.read(&mut buffer[..grant.len]).await {
-            Ok(0) => return task.fail("file truncated").await,
-            Ok(count) => count,
-            Err(error) => return task.fail(error).await,
+        let count = match timeout(PEER_IDLE_TIMEOUT, file.read(&mut buffer[..grant.len])).await {
+            Ok(Ok(0)) => return task.fail("file truncated").await,
+            Ok(Ok(count)) => count,
+            Ok(Err(error)) => return task.fail(error).await,
+            Err(_) => return task.fail("reading the shared file timed out").await,
         };
         let written = tokio::select! {
             written = write_progressing(writer, &buffer[..count]) => written,
@@ -258,11 +306,45 @@ mod tests {
     use std::io::{Read, Write};
     use std::sync::Arc;
 
+    use tokio::io::AsyncSeekExt;
     use tokio::net::{TcpListener, TcpStream};
     use tokio::task::JoinHandle;
 
     use super::*;
     use crate::network::conn::{SharedTraffic, TransferLimits, split_tracked};
+    use crate::types::FileReader;
+
+    fn upload_from(file: std::fs::File) -> OpenUpload {
+        OpenUpload::new(move |offset| {
+            Box::pin(async move {
+                let mut file = tokio::fs::File::from_std(file);
+                file.seek(std::io::SeekFrom::Start(offset)).await?;
+                Ok(Box::new(file) as FileReader)
+            })
+        })
+    }
+
+    fn download_into(file: std::fs::File) -> OpenDownload {
+        OpenDownload::new(move || {
+            Box::pin(
+                async move { Ok((Box::new(tokio::fs::File::from_std(file)) as FileWriter, 0)) },
+            )
+        })
+    }
+
+    fn file_errors(events: &mut mpsc::Receiver<ConnEvent>) -> Vec<String> {
+        let mut errors = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let ConnEvent::File {
+                event: FileEvent::Error(error),
+                ..
+            } = event
+            {
+                errors.push(error);
+            }
+        }
+        errors
+    }
 
     fn temp_path(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -336,7 +418,7 @@ mod tests {
         harness
             .control
             .send(ConnControl::Upload {
-                file,
+                open: upload_from(file),
                 size: 100_000,
             })
             .await
@@ -373,9 +455,8 @@ mod tests {
         harness
             .control
             .send(ConnControl::Download {
-                file,
-                offset: 0,
-                bytes_left: payload.len() as u64,
+                open: download_into(file),
+                size: payload.len() as u64,
             })
             .await
             .unwrap();
@@ -391,5 +472,97 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert_eq!(written, payload);
         assert_done(&mut harness.events);
+    }
+
+    #[tokio::test]
+    async fn an_upload_offset_beyond_the_file_is_refused() {
+        let mut harness = start(Arc::new(TransferLimits::default())).await;
+        harness
+            .control
+            .send(ConnControl::SendFileInit(9))
+            .await
+            .unwrap();
+        let opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let open = OpenUpload::new({
+            let opened = opened.clone();
+            move |_| {
+                opened.store(true, std::sync::atomic::Ordering::Relaxed);
+                Box::pin(async { Ok(Box::new(tokio::io::empty()) as FileReader) })
+            }
+        });
+        harness
+            .control
+            .send(ConnControl::Upload { open, size: 10 })
+            .await
+            .unwrap();
+        assert_eq!(harness.peer.read_u32_le().await.unwrap(), 9);
+        harness.peer.write_u64_le(11).await.unwrap();
+        harness.task.await.unwrap();
+
+        assert!(!opened.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(
+            file_errors(&mut harness.events),
+            vec!["peer requested offset 11 beyond the 10 byte file".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_download_that_cannot_open_its_file_never_sends_an_offset() {
+        let mut harness = start(Arc::new(TransferLimits::default())).await;
+        harness.peer.write_u32_le(5).await.unwrap();
+        harness.events.recv().await.unwrap();
+        let open =
+            OpenDownload::new(|| Box::pin(async { Err(std::io::Error::other("storage offline")) }));
+        harness
+            .control
+            .send(ConnControl::Download { open, size: 10 })
+            .await
+            .unwrap();
+        harness.task.await.unwrap();
+
+        let mut sent = Vec::new();
+        harness.peer.read_to_end(&mut sent).await.unwrap();
+        assert!(sent.is_empty());
+        assert_eq!(
+            file_errors(&mut harness.events),
+            vec!["storage offline".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_partial_larger_than_the_file_fails_without_completing() {
+        let mut harness = start(Arc::new(TransferLimits::default())).await;
+        harness.peer.write_u32_le(5).await.unwrap();
+        harness.events.recv().await.unwrap();
+        let open = OpenDownload::new(|| {
+            Box::pin(async { Ok((Box::new(tokio::io::sink()) as FileWriter, 12)) })
+        });
+        harness
+            .control
+            .send(ConnControl::Download { open, size: 10 })
+            .await
+            .unwrap();
+        harness.task.await.unwrap();
+
+        let mut completed = false;
+        let mut errors = Vec::new();
+        while let Ok(event) = harness.events.try_recv() {
+            match event {
+                ConnEvent::File {
+                    event: FileEvent::DownloadProgress { bytes_left: 0 },
+                    ..
+                } => completed = true,
+                ConnEvent::File {
+                    event: FileEvent::Error(error),
+                    ..
+                } => errors.push(error),
+                _ => {}
+            }
+        }
+        assert!(!completed);
+        assert_eq!(
+            errors,
+            vec!["partial download holds 12 bytes of a 10 byte file".to_owned()]
+        );
     }
 }

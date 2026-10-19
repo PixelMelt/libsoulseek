@@ -168,25 +168,17 @@ impl Actor {
             }
             NetworkCommand::DownloadFile {
                 conn_id,
-                file,
-                offset,
-                bytes_left,
+                open,
+                size,
             } => {
-                self.push_conn(
-                    conn_id,
-                    ConnControl::Download {
-                        file,
-                        offset,
-                        bytes_left,
-                    },
-                );
+                self.push_conn(conn_id, ConnControl::Download { open, size });
             }
             NetworkCommand::UploadFile {
                 conn_id,
-                file,
+                open,
                 size,
             } => {
-                self.push_conn(conn_id, ConnControl::Upload { file, size });
+                self.push_conn(conn_id, ConnControl::Upload { open, size });
             }
             NetworkCommand::SetTransferLimits {
                 upload_bps,

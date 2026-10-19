@@ -21,7 +21,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, timeout};
 
-use crate::network::{AllowedResponse, ConnId};
+use crate::network::{AllowedResponse, ConnId, OpenDownload, OpenUpload};
 use crate::protocol::{DistributedMessage, PeerInitMessage, PeerMessage, ServerResponse};
 use crate::types::ConnectionType;
 
@@ -137,12 +137,11 @@ pub enum ConnControl {
         conn_type: ConnectionType,
     },
     Download {
-        file: std::fs::File,
-        offset: u64,
-        bytes_left: u64,
+        open: OpenDownload,
+        size: u64,
     },
     Upload {
-        file: std::fs::File,
+        open: OpenUpload,
         size: u64,
     },
     Close,

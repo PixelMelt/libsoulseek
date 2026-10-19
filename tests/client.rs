@@ -8,16 +8,20 @@ use std::time::Duration;
 use tokio::sync::mpsc::Receiver;
 use tokio::time::timeout;
 
-use common::{client_config, free_port, start_fake_server, temp_dir, tempfile};
+use common::{
+    client_config, free_port, local_downloads, local_shares, start_fake_server, temp_dir, tempfile,
+    upload_from,
+};
 use soulseek::client::{
     Client, ClientBootstrap, ClientEvent, EnqueueResult, Observation, RetryResult, SearchScope,
     TransferWork,
 };
 use soulseek::network::{NetworkCommand, NetworkEvent, NetworkHandle, spawn as spawn_network};
 use soulseek::protocol::PeerMessage;
+use soulseek::storage::SharedFolder;
 use soulseek::types::{
     ConnectionType, DescriptionTemplate, FileAttributes, FileInfo, FolderContents, Restriction,
-    SharedFolder, TransferDirection, TransferId, TransferSnapshot, TransferStatus,
+    TransferDirection, TransferId, TransferSnapshot, TransferStatus,
 };
 
 async fn wait<E, T>(events: &mut Receiver<E>, mut matcher: impl FnMut(E) -> Option<T>) -> T {
@@ -165,14 +169,25 @@ async fn login(
     (client, events, transfers)
 }
 
-fn sharing_config(server: SocketAddr, username: &str, share_dir: PathBuf) -> ClientBootstrap {
-    let mut config = client_config(server, username);
-    config.runtime.shared_folders = vec![SharedFolder {
+fn music_share(share_dir: PathBuf) -> Vec<SharedFolder> {
+    vec![SharedFolder {
         virtual_name: "Music".into(),
         path: share_dir,
         buddy_only: false,
-    }];
+    }]
+}
+
+fn sharing_config(server: SocketAddr, username: &str, share_dir: PathBuf) -> ClientBootstrap {
+    let mut config = client_config(server, username);
+    config.shares = local_shares(&temp_dir(), music_share(share_dir));
     config
+}
+
+fn downloading_config(server: SocketAddr, username: &str) -> (ClientBootstrap, PathBuf) {
+    let mut config = client_config(server, username);
+    let download_dir = temp_dir();
+    config.downloads = local_downloads(&download_dir);
+    (config, download_dir)
 }
 
 fn payload() -> Vec<u8> {
@@ -187,8 +202,7 @@ async fn client_downloads_file_from_peer() {
 
     let (uploader, mut uploader_events) = net_peer(server_addr, "alice").await;
 
-    let bob_config = client_config(server_addr, "bob");
-    let download_dir = bob_config.runtime.transfers.download_dir.clone();
+    let (bob_config, download_dir) = downloading_config(server_addr, "bob");
     let (bob, mut bob_events, mut bob_transfers) = Client::spawn(bob_config);
     logged_in(&mut bob_events).await;
 
@@ -252,7 +266,7 @@ async fn client_downloads_file_from_peer() {
     .await;
     uploader.send(NetworkCommand::UploadFile {
         conn_id: upload_conn,
-        file: source,
+        open: upload_from(source),
         size: payload.len() as u64,
     });
 
@@ -304,8 +318,7 @@ async fn client_shares_answers_search_and_uploads() {
     })
     .await;
 
-    let frank_config = client_config(server_addr, "frank");
-    let download_dir = frank_config.runtime.transfers.download_dir.clone();
+    let (frank_config, download_dir) = downloading_config(server_addr, "frank");
     let (frank, mut frank_events, mut frank_transfers) = Client::spawn(frank_config);
     logged_in(&mut frank_events).await;
 
@@ -396,11 +409,14 @@ async fn wishlist_search_runs_on_interval() {
     std::fs::write(share_dir.join("wishlist gem.mp3"), b"g".repeat(500)).unwrap();
 
     let mut grace_config = client_config(server_addr, "grace");
-    grace_config.runtime.shared_folders = vec![SharedFolder {
-        virtual_name: "Stash".into(),
-        path: share_dir,
-        buddy_only: false,
-    }];
+    grace_config.shares = local_shares(
+        &temp_dir(),
+        vec![SharedFolder {
+            virtual_name: "Stash".into(),
+            path: share_dir,
+            buddy_only: false,
+        }],
+    );
     let (_grace, mut grace_events, _grace_transfers) = Client::spawn(grace_config);
     shares_installed(&mut grace_events).await;
 
@@ -821,8 +837,10 @@ async fn removing_every_share_installs_an_empty_index_without_a_cache() {
 
     let share_dir = temp_dir();
     std::fs::write(share_dir.join("song.mp3"), b"payload".repeat(100)).unwrap();
-    let eve_config = sharing_config(server_addr, "eve", share_dir);
-    let (eve, mut eve_events, _eve_transfers) = Client::spawn(eve_config.clone());
+    let cache_dir = temp_dir();
+    let mut eve_config = client_config(server_addr, "eve");
+    eve_config.shares = local_shares(&cache_dir, music_share(share_dir));
+    let (eve, mut eve_events, _eve_transfers) = Client::spawn(eve_config);
     seen(&mut eve_events, |event| {
         matches!(event, ClientEvent::SharesInstalled { files: 1, .. })
     })
@@ -832,10 +850,8 @@ async fn removing_every_share_installs_an_empty_index_without_a_cache() {
     })
     .await;
 
-    std::fs::remove_file(&eve_config.share_catalog).unwrap();
-    let mut runtime = eve_config.runtime.clone();
-    runtime.shared_folders = Vec::new();
-    eve.apply_config(runtime).await;
+    std::fs::remove_file(cache_dir.join("share-catalog.gz")).unwrap();
+    eve.set_shares(local_shares(&cache_dir, Vec::new())).await;
     wait(&mut eve_events, |event| match event {
         ClientEvent::SharesInstalled {
             folders: 0,

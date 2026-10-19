@@ -9,7 +9,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::Receiver;
 use tokio::time::timeout;
 
-use common::{frame, free_port, start_fake_server, tempfile};
+use common::{download_into, frame, free_port, start_fake_server, tempfile, upload_from};
 use soulseek::network::spawn;
 use soulseek::network::{AllowedResponse, NetworkCommand, NetworkEvent};
 use soulseek::protocol::{
@@ -113,13 +113,12 @@ async fn login_peer_message_and_file_transfer() {
 
     alice.handle.send(NetworkCommand::DownloadFile {
         conn_id: download_conn,
-        file: dest,
-        offset: 0,
-        bytes_left: payload.len() as u64,
+        open: download_into(dest),
+        size: payload.len() as u64,
     });
     bob.handle.send(NetworkCommand::UploadFile {
         conn_id: upload_conn,
-        file: source,
+        open: upload_from(source),
         size: payload.len() as u64,
     });
 

@@ -116,6 +116,13 @@ impl<T> Registry<T> {
         Some(conn_id)
     }
 
+    pub(super) fn detach_conns(&mut self) {
+        self.conns.clear();
+        for entry in self.entries.values_mut() {
+            entry.conn_id = None;
+        }
+    }
+
     pub(super) fn detach(&mut self, key: &TransferKey) -> Detached {
         Detached {
             token: self.detach_token(key),

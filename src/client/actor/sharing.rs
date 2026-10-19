@@ -1,16 +1,17 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::time::Instant;
+use tracing::warn;
 
 use super::ClientActor;
-use crate::client::shares::{self, ScanError, ShareCatalog, SharesIndex};
+use crate::client::shares::{self, SharesIndex};
 use crate::client::{ClientEvent, Observation};
 use crate::protocol::{PeerMessage, ServerRequest};
+use crate::storage::{ScanError, ScanProgress, ShareCatalog, ShareSource};
 use crate::types::Restriction;
 
 const BROWSE_COALESCE_WINDOW: Duration = Duration::from_millis(400);
@@ -18,42 +19,44 @@ const BROWSE_COALESCE_WINDOW: Duration = Duration::from_millis(400);
 pub(super) enum ScanUpdate {
     Progress(u64),
     Index(Box<SharesIndex>),
-    CachedReady,
+    Loaded,
     Done(Result<(), ScanError>),
 }
 
+type ScanResults = mpsc::UnboundedSender<(u64, ScanUpdate)>;
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ScanJob {
-    pub(super) install_cached: bool,
-    pub(super) walk: bool,
+    pub(super) load: bool,
+    pub(super) scan: bool,
 }
 
 impl ScanJob {
     pub(super) const RESCAN: Self = Self {
-        install_cached: false,
-        walk: true,
+        load: false,
+        scan: true,
     };
     pub(super) const RELOAD: Self = Self {
-        install_cached: true,
-        walk: true,
+        load: true,
+        scan: true,
     };
 
     fn merge(self, other: Self) -> Self {
         Self {
-            install_cached: self.install_cached || other.install_cached,
-            walk: self.walk || other.walk,
+            load: self.load || other.load,
+            scan: self.scan || other.scan,
         }
     }
 }
 
 pub(super) struct Sharing {
     pub(super) index: Option<SharesIndex>,
+    source: Arc<dyn ShareSource>,
     running: Option<ScanJob>,
-    pub(super) cached_loading: bool,
+    pub(super) loading: bool,
     pending: Option<ScanJob>,
     cancel: Arc<AtomicBool>,
-    scan_results: mpsc::UnboundedSender<(u64, ScanUpdate)>,
-    share_catalog: PathBuf,
+    scan_results: ScanResults,
     generation: u64,
     last_progress: u64,
     pub(super) excluded_phrases: Vec<String>,
@@ -62,18 +65,15 @@ pub(super) struct Sharing {
 }
 
 impl Sharing {
-    pub(super) fn new(
-        scan_results: mpsc::UnboundedSender<(u64, ScanUpdate)>,
-        share_catalog: PathBuf,
-    ) -> Self {
+    pub(super) fn new(scan_results: ScanResults, source: Arc<dyn ShareSource>) -> Self {
         Self {
             index: None,
+            source,
             running: None,
-            cached_loading: false,
+            loading: false,
             pending: None,
             cancel: Arc::new(AtomicBool::new(false)),
             scan_results,
-            share_catalog,
             generation: 0,
             last_progress: 0,
             excluded_phrases: Vec::new(),
@@ -93,6 +93,55 @@ impl Sharing {
     }
 }
 
+async fn install(
+    generation: u64,
+    results: &ScanResults,
+    catalog: ShareCatalog,
+    source: &Arc<dyn ShareSource>,
+) -> Result<(), ScanError> {
+    let source = source.clone();
+    let index =
+        tokio::task::spawn_blocking(move || SharesIndex::from_catalog(Arc::new(catalog), source))
+            .await
+            .map_err(|error| ScanError::Panicked {
+                reason: error.to_string(),
+            })?
+            .map_err(|error| ScanError::Source(Box::new(error)))?;
+    let _ = results.send((generation, ScanUpdate::Index(Box::new(index))));
+    Ok(())
+}
+
+async fn load(
+    generation: u64,
+    results: &ScanResults,
+    source: &Arc<dyn ShareSource>,
+) -> Result<(), ScanError> {
+    match source.load().await? {
+        Some(catalog) => install(generation, results, catalog, source).await,
+        None => Ok(()),
+    }
+}
+
+async fn refresh(
+    job: ScanJob,
+    generation: u64,
+    results: ScanResults,
+    source: Arc<dyn ShareSource>,
+    progress: ScanProgress,
+) -> Result<(), ScanError> {
+    if job.load {
+        if let Err(error) = load(generation, &results, &source).await {
+            warn!(%error, "cannot serve the loaded shares, waiting for the scan");
+        }
+        let _ = results.send((generation, ScanUpdate::Loaded));
+    }
+    if job.scan {
+        let catalog = source.scan(progress).await?;
+        install(generation, &results, catalog, &source).await?;
+    }
+    Ok(())
+}
+
 impl ClientActor {
     pub(super) fn start_scan(&mut self, job: ScanJob) {
         self.sharing.generation += 1;
@@ -100,8 +149,8 @@ impl ClientActor {
         if let Some(running) = self.sharing.running {
             self.sharing.cancel.store(true, Ordering::Relaxed);
             let job = job.merge(ScanJob {
-                install_cached: running.install_cached,
-                walk: false,
+                load: running.load,
+                scan: false,
             });
             self.sharing.pending = Some(
                 self.sharing
@@ -113,50 +162,30 @@ impl ClientActor {
         self.spawn_scan(job);
     }
 
+    pub(super) fn set_shares(&mut self, source: Arc<dyn ShareSource>) {
+        self.sharing.source = source;
+        self.start_scan(ScanJob::RELOAD);
+    }
+
     fn spawn_scan(&mut self, job: ScanJob) {
         self.sharing.last_progress = 0;
         self.sharing.running = Some(job);
-        self.sharing.cached_loading = job.install_cached;
+        self.sharing.loading = job.load;
         self.sharing.cancel = Arc::new(AtomicBool::new(false));
         let generation = self.sharing.generation;
-        let shared_folders = self.config.shared_folders.clone();
-        let share_filters = self.config.share_filters.clone();
-        let cache_path = self.sharing.share_catalog.clone();
-        let cancel = self.sharing.cancel.clone();
         let results = self.sharing.scan_results.clone();
-        let task = tokio::task::spawn_blocking({
+        let progress = ScanProgress::new(self.sharing.cancel.clone(), {
             let results = results.clone();
-            move || {
-                let send = |update: ScanUpdate| {
-                    let _ = results.send((generation, update));
-                };
-                let install = |catalog| {
-                    send(ScanUpdate::Index(Box::new(SharesIndex::from_catalog(
-                        catalog,
-                    ))));
-                };
-                if shared_folders.is_empty() {
-                    install(ShareCatalog::empty());
-                    send(ScanUpdate::Done(Ok(())));
-                    return;
-                }
-                let cached = shares::load_catalog(&cache_path);
-                if job.install_cached && !cached.folders.is_empty() {
-                    install(shares::restrict(&cached, &shared_folders));
-                }
-                send(ScanUpdate::CachedReady);
-                if !job.walk {
-                    send(ScanUpdate::Done(Ok(())));
-                    return;
-                }
-                let progress = |files| send(ScanUpdate::Progress(files));
-                let result =
-                    shares::walk(&shared_folders, &share_filters, &cached, &cancel, &progress);
-                drop(cached);
-                send(ScanUpdate::Done(result.map(|catalog| {
-                    shares::save_catalog(&cache_path, &catalog);
-                    install(catalog);
-                })));
+            move |files| {
+                let _ = results.send((generation, ScanUpdate::Progress(files)));
+            }
+        });
+        let task = tokio::spawn({
+            let results = results.clone();
+            let source = self.sharing.source.clone();
+            async move {
+                let result = refresh(job, generation, results.clone(), source, progress).await;
+                let _ = results.send((generation, ScanUpdate::Done(result)));
             }
         });
         tokio::spawn(async move {
@@ -187,15 +216,15 @@ impl ClientActor {
                     tokio::task::spawn_blocking(move || drop(index));
                 }
             }
-            ScanUpdate::CachedReady => {
+            ScanUpdate::Loaded => {
                 if current {
-                    self.sharing.cached_loading = false;
+                    self.sharing.loading = false;
                     self.connect_if_deferred();
                 }
             }
             ScanUpdate::Done(result) => {
                 self.sharing.running = None;
-                self.sharing.cached_loading = false;
+                self.sharing.loading = false;
                 if current {
                     match result {
                         Ok(()) => self.emit(ClientEvent::ShareScanFinished),

@@ -1,13 +1,17 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
+use soulseek::network::{OpenDownload, OpenUpload};
 use soulseek::protocol::MessageWriter;
+use soulseek::storage::{DownloadStore, LocalDownloads, LocalShares, ShareSource, SharedFolder};
+use soulseek::types::{FileReader, FileWriter};
 
 pub struct FakeClient {
     pub port: u16,
@@ -180,6 +184,7 @@ fn temp_path() -> std::path::PathBuf {
     ))
 }
 
+#[allow(dead_code)]
 pub fn tempfile() -> std::fs::File {
     std::fs::OpenOptions::new()
         .create(true)
@@ -198,10 +203,46 @@ pub fn temp_dir() -> std::path::PathBuf {
 }
 
 #[allow(dead_code)]
+pub fn upload_from(file: std::fs::File) -> OpenUpload {
+    OpenUpload::new(move |offset| {
+        Box::pin(async move {
+            let mut file = tokio::fs::File::from_std(file);
+            file.seek(std::io::SeekFrom::Start(offset)).await?;
+            Ok(Box::new(file) as FileReader)
+        })
+    })
+}
+
+#[allow(dead_code)]
+pub fn download_into(file: std::fs::File) -> OpenDownload {
+    OpenDownload::new(move || {
+        Box::pin(async move { Ok((Box::new(tokio::fs::File::from_std(file)) as FileWriter, 0)) })
+    })
+}
+
+#[allow(dead_code)]
+pub fn local_shares(cache_dir: &Path, folders: Vec<SharedFolder>) -> Arc<dyn ShareSource> {
+    Arc::new(LocalShares::new(folders, Vec::new(), cache_dir.join("share-catalog.gz")).unwrap())
+}
+
+#[allow(dead_code)]
+pub fn local_downloads(download_dir: &Path) -> Arc<dyn DownloadStore> {
+    Arc::new(
+        LocalDownloads::new(
+            download_dir.to_path_buf(),
+            download_dir.join("incomplete"),
+            false,
+        )
+        .unwrap(),
+    )
+}
+
+#[allow(dead_code)]
 pub fn client_config(server: SocketAddr, username: &str) -> soulseek::client::ClientBootstrap {
-    let download_dir = temp_dir();
+    let dir = temp_dir();
     soulseek::client::ClientBootstrap {
-        share_catalog: download_dir.join("share-catalog.gz"),
+        shares: local_shares(&dir, Vec::new()),
+        downloads: local_downloads(&dir),
         scan_on_startup: true,
         connect_on_startup: true,
         runtime: soulseek::types::RuntimeConfig {
@@ -214,19 +255,14 @@ pub fn client_config(server: SocketAddr, username: &str) -> soulseek::client::Cl
             description: soulseek::types::DescriptionTemplate::default(),
             auto_reconnect: true,
             transfers: soulseek::types::TransferConfig {
-                incomplete_dir: download_dir.join("incomplete"),
-                download_dir,
                 upload_slots: soulseek::types::DEFAULT_UPLOAD_SLOTS,
                 queue_file_limit: soulseek::types::DEFAULT_QUEUE_FILE_LIMIT,
                 upload_limit_kbps: 0,
                 download_limit_kbps: 0,
                 queue_size_limit_mb: 0,
                 banned_message: soulseek::types::DEFAULT_BANNED_MESSAGE.into(),
-                download_username_subfolders: false,
             },
             search: soulseek::types::SearchConfig::default(),
-            shared_folders: Vec::new(),
-            share_filters: Vec::new(),
         },
         buddies: Vec::new(),
         banned: Vec::new(),

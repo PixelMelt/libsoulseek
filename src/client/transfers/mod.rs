@@ -1,18 +1,21 @@
 mod downloads;
-mod files;
 mod folders;
 mod queue;
 mod registry;
 mod speed;
 mod uploads;
 
-pub(super) use downloads::Downloads;
+pub(super) use downloads::{CheckAnswer, Downloads};
 pub(super) use folders::{FolderRequests, destination_root};
 pub(super) use uploads::Uploads;
 
+use std::io;
 use std::time::Duration;
 
-use crate::types::{TransferDirection, TransferId, TransferSnapshot, TransferStatus};
+use tokio::sync::mpsc;
+
+use crate::types::{BoxFuture, TransferDirection, TransferId, TransferSnapshot, TransferStatus};
+use registry::TransferKey;
 
 const TRANSFER_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 const USER_OFFLINE: &str = "user is offline";
@@ -65,6 +68,40 @@ pub enum TransferWork {
     },
 }
 
+pub(in crate::client) enum StorageDone {
+    Checked {
+        sequence: u64,
+        answer: CheckAnswer,
+    },
+    Placed {
+        key: TransferKey,
+        epoch: u64,
+        result: io::Result<String>,
+    },
+    Sized {
+        key: TransferKey,
+        token: u32,
+        result: io::Result<u64>,
+    },
+}
+
+pub(in crate::client) type StorageSender = mpsc::UnboundedSender<StorageDone>;
+
+fn spawn_storage<T: Send + 'static>(
+    storage: &StorageSender,
+    work: BoxFuture<T>,
+    done: impl FnOnce(Result<T, String>) -> StorageDone + Send + 'static,
+) {
+    let storage = storage.clone();
+    let task = tokio::spawn(work);
+    tokio::spawn(async move {
+        let result = task
+            .await
+            .map_err(|error| format!("storage task panicked: {error}"));
+        let _ = storage.send(done(result));
+    });
+}
+
 pub(super) struct TransferIds {
     next: u64,
 }
@@ -85,6 +122,7 @@ impl TransferIds {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum TransferPhase {
+    Checking(u64),
     Queued,
     Limited,
     GettingStatus,
@@ -98,7 +136,9 @@ pub(super) enum TransferPhase {
 impl TransferPhase {
     pub(super) fn status(&self) -> TransferStatus {
         match self {
-            Self::Queued | Self::Limited | Self::GettingStatus => TransferStatus::Queued,
+            Self::Checking(_) | Self::Queued | Self::Limited | Self::GettingStatus => {
+                TransferStatus::Queued
+            }
             Self::Transferring | Self::Placing => TransferStatus::Transferring,
             Self::Finished => TransferStatus::Finished,
             Self::Aborted => TransferStatus::Aborted,
@@ -109,7 +149,12 @@ impl TransferPhase {
     pub(super) fn is_active(&self) -> bool {
         matches!(
             self,
-            Self::Queued | Self::Limited | Self::GettingStatus | Self::Transferring | Self::Placing
+            Self::Checking(_)
+                | Self::Queued
+                | Self::Limited
+                | Self::GettingStatus
+                | Self::Transferring
+                | Self::Placing
         )
     }
 

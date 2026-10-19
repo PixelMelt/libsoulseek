@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep_until};
 use tracing::{info, warn};
 
-use super::transfers::{Downloads, FolderRequests, TransferIds, Uploads};
+use super::transfers::{Downloads, FolderRequests, StorageDone, TransferIds, Uploads};
 use super::users::Users;
 use crate::client::{ClientBootstrap, ClientEvent, Observation, TransferWork};
 use crate::network::{
@@ -63,7 +63,7 @@ async fn run(
 ) {
     let (net, mut net_events) = spawn_network();
     let (scan_tx, mut scan_rx) = mpsc::unbounded_channel();
-    let (place_tx, mut place_rx) = mpsc::unbounded_channel();
+    let (storage_tx, mut storage_rx) = mpsc::unbounded_channel();
 
     let mut actor = ClientActor {
         net: net.clone(),
@@ -71,16 +71,11 @@ async fn run(
         transfers,
         token_counter,
         transfer_ids: TransferIds::new(&config.transfers),
-        downloads: Downloads::new(
-            net.clone(),
-            config.runtime.transfers.download_dir.clone(),
-            config.runtime.transfers.incomplete_dir.clone(),
-            config.runtime.transfers.download_username_subfolders,
-            place_tx,
-        ),
+        downloads: Downloads::new(net.clone(), config.downloads, storage_tx.clone()),
         folder_requests: FolderRequests::new(net.clone()),
         uploads: Uploads::new(
             net.clone(),
+            storage_tx,
             config.runtime.transfers.upload_slots,
             config.runtime.transfers.queue_file_limit,
             config.runtime.transfers.queue_size_limit_mb,
@@ -92,7 +87,7 @@ async fn run(
             config.ignored.into_iter().collect(),
             config.ip_bans.clone(),
         ),
-        sharing: Sharing::new(scan_tx, config.share_catalog),
+        sharing: Sharing::new(scan_tx, config.shares),
         session: Session::new(),
         wishlist: Wishlist::default(),
         searches: HashMap::new(),
@@ -113,6 +108,7 @@ async fn run(
             TransferDirection::Upload => actor.uploads.seed(seed),
         }
     }
+    actor.downloads.check_seeded();
     for term in config.wishlist {
         actor.add_wish(term);
     }
@@ -121,15 +117,15 @@ async fn run(
         actor.config.transfers.upload_limit_kbps,
         actor.config.transfers.download_limit_kbps,
     );
+    actor.start_scan(ScanJob {
+        load: true,
+        scan: config.scan_on_startup,
+    });
     if actor.config.login.username.is_empty() {
         info!("no login configured, waiting for credentials");
     } else if config.connect_on_startup {
         actor.connect();
     }
-    actor.start_scan(ScanJob {
-        install_cached: true,
-        walk: config.scan_on_startup,
-    });
 
     let mut sweep = tokio::time::interval(SWEEP_INTERVAL);
     loop {
@@ -159,11 +155,9 @@ async fn run(
                     result.expect("scan channel closed while the actor holds the sender");
                 actor.handle_scan_update(generation, update);
             }
-            result = place_rx.recv() => {
-                let (key, result) =
-                    result.expect("placement channel closed while the actor holds the sender");
-                let updates = actor.downloads.handle_placement_done(&key, result);
-                actor.emit_transfers(updates);
+            done = storage_rx.recv() => {
+                let done = done.expect("storage channel closed while the actor holds the senders");
+                actor.handle_storage_done(done);
             }
             _ = sweep.tick() => actor.sweep(),
             _ = sleep_until(reconnect_deadline), if actor.session.reconnect_at.is_some() => {
@@ -234,6 +228,22 @@ impl ClientActor {
         self.session.reconnect_at = None;
         self.session.reconnect_now = false;
         self.net.send(NetworkCommand::ServerDisconnect);
+    }
+
+    fn handle_storage_done(&mut self, done: StorageDone) {
+        let updates = match done {
+            StorageDone::Checked { sequence, answer } => {
+                self.downloads
+                    .handle_checked(self.session.logged_in, sequence, answer)
+            }
+            StorageDone::Placed { key, epoch, result } => {
+                self.downloads.handle_placement_done(&key, epoch, result)
+            }
+            StorageDone::Sized { key, token, result } => {
+                self.uploads.handle_sized(&key, token, result, &self.users)
+            }
+        };
+        self.emit_transfers(updates);
     }
 
     fn handle_network_event(&mut self, event: NetworkEvent) {

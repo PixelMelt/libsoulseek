@@ -121,11 +121,9 @@ pub(super) fn complete_file_path(dir: &Path, basename: &str, size: u64) -> Optio
 }
 
 pub(super) fn open_incomplete(
-    incomplete_dir: &Path,
     incomplete_path: &Path,
     truncate: bool,
 ) -> std::io::Result<(fs::File, u64)> {
-    fs::create_dir_all(incomplete_dir)?;
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
