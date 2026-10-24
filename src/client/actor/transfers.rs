@@ -139,11 +139,18 @@ impl ClientActor {
         self.emit_transfers(updates);
     }
 
-    pub(super) fn deny_file(&mut self, username: String, virtual_path: String, ttl: Duration) {
+    pub(super) fn deny_file(
+        &mut self,
+        username: String,
+        virtual_path: String,
+        ttl: Duration,
+        reason: String,
+    ) {
         let key = (username, virtual_path);
-        let updates = self.uploads.deny_file(&key, &self.users);
+        let updates = self.uploads.deny_file(&key, &reason, &self.users);
         self.emit_transfers(updates);
-        self.users.deny_file(key.0, key.1, Instant::now() + ttl);
+        self.users
+            .deny_file(key.0, key.1, Instant::now() + ttl, reason);
     }
 
     pub(super) fn sweep(&mut self) {

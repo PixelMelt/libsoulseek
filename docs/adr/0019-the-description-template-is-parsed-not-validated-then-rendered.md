@@ -1,6 +1,6 @@
 # 19. The description template is parsed, not validated then rendered
 
-Status: Accepted
+Status: Superseded by ADR 0033
 Nicotine+: No counterpart
 
 ## Context
@@ -14,3 +14,5 @@ A template that can fail to render must not reach the peer-response hot path.
 ## Consequences
 
 A `validate()` beside a `render()` would be two copies of the grammar plus unreachable error arms. newkitine ADR 0032 records where newkitine parses it.
+
+ADR 0033 supersedes this because the consumer owns the text and the data it needs, including statistics only the consumer has.

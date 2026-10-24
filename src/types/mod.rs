@@ -1,5 +1,4 @@
 mod connection;
-mod description;
 mod file;
 mod interests;
 mod io;
@@ -8,7 +7,6 @@ mod transfer;
 mod user;
 
 pub use connection::ConnectionType;
-pub use description::{DescriptionContext, DescriptionTemplate, description_variables};
 pub use file::{FileAttributes, FileInfo, FolderContents, UINT32_LIMIT};
 pub use interests::Recommendations;
 pub use io::{BoxFuture, FileReader, FileWriter};

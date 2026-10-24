@@ -8,6 +8,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
+use soulseek::client::{ProfileRequest, ProfileSource};
 use soulseek::network::{OpenDownload, OpenUpload};
 use soulseek::protocol::MessageWriter;
 use soulseek::storage::{DownloadStore, LocalDownloads, LocalShares, ShareSource, SharedFolder};
@@ -20,6 +21,14 @@ pub struct FakeClient {
 }
 
 pub type Registry = Arc<Mutex<HashMap<String, FakeClient>>>;
+
+pub struct TestProfile;
+
+impl ProfileSource for TestProfile {
+    fn description(&self, _request: &ProfileRequest<'_>) -> String {
+        String::new()
+    }
+}
 
 pub fn frame(code: u32, payload: Vec<u8>) -> Vec<u8> {
     let mut framed = MessageWriter::new();
@@ -243,6 +252,7 @@ pub fn client_config(server: SocketAddr, username: &str) -> soulseek::client::Cl
     soulseek::client::ClientBootstrap {
         shares: local_shares(&dir, Vec::new()),
         downloads: local_downloads(&dir),
+        profile: Arc::new(TestProfile),
         scan_on_startup: true,
         connect_on_startup: true,
         runtime: soulseek::types::RuntimeConfig {
@@ -252,7 +262,6 @@ pub fn client_config(server: SocketAddr, username: &str) -> soulseek::client::Cl
                 password: "secret".into(),
                 listen_port: free_port(),
             },
-            description: soulseek::types::DescriptionTemplate::default(),
             auto_reconnect: true,
             transfers: soulseek::types::TransferConfig {
                 upload_slots: soulseek::types::DEFAULT_UPLOAD_SLOTS,

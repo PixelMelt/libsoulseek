@@ -199,10 +199,11 @@ impl Client {
             .await;
     }
 
-    pub async fn deny_file(&self, username: &str, virtual_path: &str, ttl: Duration) {
+    pub async fn deny_file(&self, username: &str, virtual_path: &str, ttl: Duration, reason: &str) {
         let username = username.to_owned();
         let virtual_path = virtual_path.to_owned();
-        self.run(move |actor| actor.deny_file(username, virtual_path, ttl))
+        let reason = reason.to_owned();
+        self.run(move |actor| actor.deny_file(username, virtual_path, ttl, reason))
             .await;
     }
 

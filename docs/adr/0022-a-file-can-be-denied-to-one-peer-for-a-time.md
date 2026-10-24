@@ -1,6 +1,6 @@
 # 22. A file can be denied to one peer for a time
 
-Status: Accepted
+Status: Accepted (refined by ADR 0034)
 Nicotine+: No counterpart
 
 ## Context
@@ -9,7 +9,7 @@ newkitine caps how often one peer may download one file (newkitine ADR 0036). Co
 
 ## Decision
 
-`Client::deny_file(username, virtual_path, ttl)` records a denial that expires after the TTL and fails any active copy of that file for that peer, queued or transferring. Until it expires, queue requests for that file are rejected with `TransferRejectReason::REPEATED`, a custom reason Nicotine+ aborts on rather than retrying. `Client::clear_file_denials` drops every denial for a peer. A denial applies to buddies too, and writes no restriction.
+`Client::deny_file(username, virtual_path, ttl, reason)` records a denial that expires after the TTL and fails any active copy of that file for that peer, queued or transferring. Until it expires, queue requests for that file are rejected with the consumer's custom reason, which Nicotine+ aborts on rather than retrying (ADR 0034). `Client::clear_file_denials` drops every denial for a peer. A denial applies to buddies too, and writes no restriction.
 
 ## Consequences
 

@@ -262,8 +262,8 @@ impl Uploads {
         if let Some(Restriction::Denied { reason }) = users.restriction(username) {
             return Some(reason.clone());
         }
-        if users.is_file_denied(username, virtual_path) {
-            return Some(TransferRejectReason::REPEATED.into());
+        if let Some(reason) = users.file_denial(username, virtual_path) {
+            return Some(reason.into());
         }
         None
     }
@@ -367,13 +367,18 @@ impl Uploads {
         self.fail_each(&pending, reason, true, users)
     }
 
-    pub fn deny_file(&mut self, key: &TransferKey, users: &Users) -> Vec<TransferWork> {
+    pub fn deny_file(
+        &mut self,
+        key: &TransferKey,
+        reason: &str,
+        users: &Users,
+    ) -> Vec<TransferWork> {
         let active = |transfer: &UploadTransfer| transfer.phase.is_active();
         if !self.transfers.get(key).is_some_and(active) {
             return Vec::new();
         }
         let keys = std::slice::from_ref(key);
-        self.fail_each(keys, TransferRejectReason::REPEATED, true, users)
+        self.fail_each(keys, reason, true, users)
     }
 
     pub fn revalidate(&mut self, shares: &SharesIndex, users: &Users) -> Vec<TransferWork> {
@@ -1147,9 +1152,14 @@ mod tests {
             "peer".into(),
             TRACKS[0].into(),
             Instant::now() + Duration::from_secs(60),
+            "consumer cap".into(),
         );
 
         assert!(!harness.request("peer", TRACKS[0]).1);
+        assert_eq!(
+            harness.uploads.refusal("peer", TRACKS[0], &harness.users),
+            Some("consumer cap".into())
+        );
         harness.queue("peer", TRACKS[1]);
         harness.queue("other", TRACKS[0]);
     }

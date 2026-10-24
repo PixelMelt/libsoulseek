@@ -2,6 +2,7 @@ mod actor;
 mod bootstrap;
 mod event;
 mod observation;
+mod profile;
 mod punctuation;
 mod search;
 mod shares;
@@ -12,6 +13,7 @@ pub use actor::Client;
 pub use bootstrap::ClientBootstrap;
 pub use event::{ClientEvent, SearchResult, UserInfoReceived};
 pub use observation::Observation;
+pub use profile::{ProfileRequest, ProfileSource};
 pub use search::SearchScope;
 pub use transfers::{AbortResult, EnqueueResult, RetryResult, TransferWork};
 

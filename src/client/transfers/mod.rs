@@ -186,6 +186,4 @@ impl TransferRejectReason {
     pub(super) const USER_LIMIT_PREFIX: &'static str = "User limit of";
     pub(super) const PENDING_SHUTDOWN: &'static str = "Pending shutdown.";
     pub(super) const FILE_READ_ERROR: &'static str = "File read error.";
-    pub(super) const REPEATED: &'static str =
-        "Already sent to you several times; message me if your client is stuck";
 }

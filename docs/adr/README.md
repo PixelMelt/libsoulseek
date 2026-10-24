@@ -28,10 +28,10 @@ Records 0001 to 0028 began in newkitine and were renumbered here. newkitine's in
 | [0016](0016-search-answering-stays-inline-on-the-client-actor.md) | Search answering stays inline on the client actor | Accepted | No counterpart |
 | [0017](0017-deferred-request-overflow-answers-too-many-files.md) | Deferred-request overflow answers "Too many files" | Superseded by ADR 0020 | No counterpart |
 | [0018](0018-the-attribute-cache-is-skipped-when-the-scan-changed-nothing.md) | The attribute cache is skipped when the scan changed nothing | Superseded by ADR 0020 | No counterpart |
-| [0019](0019-the-description-template-is-parsed-not-validated-then-rendered.md) | The description template is parsed, not validated then rendered | Accepted | No counterpart |
+| [0019](0019-the-description-template-is-parsed-not-validated-then-rendered.md) | The description template is parsed, not validated then rendered | Superseded by ADR 0033 | No counterpart |
 | [0020](0020-the-share-catalog-is-persisted-and-served-at-boot.md) | The share catalog is persisted and served at boot | Accepted (supersedes ADR 0003 in part, ADR 0017 and ADR 0018; refines newkitine ADR 0033; refined by ADR 0030) | Matches: Nicotine+ persists its share databases, serves them at login, and keeps serving the old list during a rescan |
 | [0021](0021-installing-an-index-re-validates-active-uploads.md) | Installing an index re-validates active uploads | Accepted (supersedes ADR 0003; refined by ADR 0030) | Stricter than Nicotine+, which does not re-check uploads against a new share list |
-| [0022](0022-a-file-can-be-denied-to-one-peer-for-a-time.md) | A file can be denied to one peer for a time | Accepted | No counterpart |
+| [0022](0022-a-file-can-be-denied-to-one-peer-for-a-time.md) | A file can be denied to one peer for a time | Accepted (refined by ADR 0034) | No counterpart |
 | [0023](0023-speed-limits-are-one-shared-budget-per-direction.md) | Speed limits are one shared budget per direction | Accepted | Matches the default total limit; Nicotine+ divides it by the active transfer count instead of sharing a budget |
 | [0024](0024-peer-connection-close-is-immediate-and-surfaces-unsent-messages.md) | Peer connection close is immediate and surfaces unsent messages | Accepted | Matches: Nicotine+ clears closing buffers, re-routes later sends and reports unprocessed messages |
 | [0025](0025-the-share-walk-follows-symlinks-and-skips-colliding-paths.md) | The share walk follows symlinks and skips colliding paths | Accepted (refines ADR 0013 and ADR 0020; refined by ADR 0030) | Matches: Nicotine+ follows symlinks and skips already-shared decoded paths |
@@ -42,3 +42,5 @@ Records 0001 to 0028 began in newkitine and were renumbered here. newkitine's in
 | [0030](0030-shares-come-from-a-share-source-and-downloads-go-to-a-download-store.md) | Shares come from a ShareSource and downloads go to a DownloadStore | Accepted (refines ADR 0012, ADR 0014, ADR 0020, ADR 0021 and ADR 0025) | Diverges: Nicotine+ shares and downloads local files only; the local implementations keep its behaviour |
 | [0031](0031-storage-work-never-runs-on-the-client-actor.md) | Storage work never runs on the client actor | Accepted (refines ADR 0012) | No counterpart |
 | [0032](0032-share-rules-live-with-the-catalog-and-local-shares.md) | Share rules live with the catalog and LocalShares | Accepted (supersedes ADR 0029 in part) | No counterpart |
+| [0033](0033-the-consumer-writes-the-profile-description.md) | The consumer writes the profile description | Accepted (supersedes ADR 0019) | No counterpart |
+| [0034](0034-a-file-denial-carries-the-consumers-reason.md) | A file denial carries the consumer's reason | Accepted (refines ADR 0022) | No counterpart |

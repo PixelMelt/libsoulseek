@@ -31,7 +31,7 @@ pub(super) struct Users {
     pub ignored: HashSet<String>,
     ip_bans: Vec<String>,
     restrictions: HashMap<String, Restriction>,
-    file_denials: HashMap<String, HashMap<String, Instant>>,
+    file_denials: HashMap<String, HashMap<String, (Instant, String)>>,
     privileged: HashSet<String>,
     login_username: String,
     watched: HashMap<String, Option<UserStatus>>,
@@ -81,27 +81,34 @@ impl Users {
         self.restrictions.get(username)
     }
 
-    pub fn deny_file(&mut self, username: String, virtual_path: String, until: Instant) {
+    pub fn deny_file(
+        &mut self,
+        username: String,
+        virtual_path: String,
+        until: Instant,
+        reason: String,
+    ) {
         let now = Instant::now();
         self.file_denials.retain(|_, files| {
-            files.retain(|_, expiry| *expiry > now);
+            files.retain(|_, (expiry, _)| *expiry > now);
             !files.is_empty()
         });
         self.file_denials
             .entry(username)
             .or_default()
-            .insert(virtual_path, until);
+            .insert(virtual_path, (until, reason));
     }
 
     pub fn clear_file_denials(&mut self, username: &str) {
         self.file_denials.remove(username);
     }
 
-    pub fn is_file_denied(&self, username: &str, virtual_path: &str) -> bool {
+    pub fn file_denial(&self, username: &str, virtual_path: &str) -> Option<&str> {
         self.file_denials
             .get(username)
             .and_then(|files| files.get(virtual_path))
-            .is_some_and(|until| *until > Instant::now())
+            .filter(|(until, _)| *until > Instant::now())
+            .map(|(_, reason)| reason.as_str())
     }
 
     pub fn is_buddy(&self, username: &str) -> bool {
@@ -227,13 +234,18 @@ mod tests {
     fn file_denials_expire_and_clear() {
         let mut users = Users::default();
         let later = Instant::now() + std::time::Duration::from_secs(60);
-        users.deny_file("peer".into(), "a\\b.mp3".into(), later);
-        users.deny_file("peer".into(), "a\\c.mp3".into(), Instant::now());
-        assert!(users.is_file_denied("peer", "a\\b.mp3"));
-        assert!(!users.is_file_denied("peer", "a\\c.mp3"));
-        assert!(!users.is_file_denied("other", "a\\b.mp3"));
+        users.deny_file("peer".into(), "a\\b.mp3".into(), later, "stop".into());
+        users.deny_file(
+            "peer".into(),
+            "a\\c.mp3".into(),
+            Instant::now(),
+            "expired".into(),
+        );
+        assert_eq!(users.file_denial("peer", "a\\b.mp3"), Some("stop"));
+        assert_eq!(users.file_denial("peer", "a\\c.mp3"), None);
+        assert_eq!(users.file_denial("other", "a\\b.mp3"), None);
         users.clear_file_denials("peer");
-        assert!(!users.is_file_denied("peer", "a\\b.mp3"));
+        assert_eq!(users.file_denial("peer", "a\\b.mp3"), None);
     }
 
     #[test]

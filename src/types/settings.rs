@@ -1,7 +1,5 @@
 use std::net::SocketAddr;
 
-use crate::types::DescriptionTemplate;
-
 pub const DEFAULT_SERVER: &str = "server.slsknet.org:2242";
 pub const DEFAULT_UPLOAD_SLOTS: usize = 2;
 pub const DEFAULT_QUEUE_FILE_LIMIT: usize = 500;
@@ -15,7 +13,6 @@ const MAX_QUEUE_SIZE_LIMIT_MB: u64 = 1 << 30;
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeConfig {
     pub login: LoginConfig,
-    pub description: DescriptionTemplate,
     pub auto_reconnect: bool,
     pub transfers: TransferConfig,
     pub search: SearchConfig,
@@ -98,7 +95,6 @@ mod tests {
                 password: "secret".into(),
                 listen_port: 2234,
             },
-            description: DescriptionTemplate::default(),
             auto_reconnect: true,
             transfers: TransferConfig {
                 upload_slots: DEFAULT_UPLOAD_SLOTS,

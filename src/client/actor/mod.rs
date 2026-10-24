@@ -18,7 +18,7 @@ use tracing::{info, warn};
 
 use super::transfers::{Downloads, FolderRequests, StorageDone, TransferIds, Uploads};
 use super::users::Users;
-use crate::client::{ClientBootstrap, ClientEvent, Observation, TransferWork};
+use crate::client::{ClientBootstrap, ClientEvent, Observation, ProfileSource, TransferWork};
 use crate::network::{
     AllowedResponse, NetworkCommand, NetworkEvent, NetworkHandle, spawn as spawn_network,
 };
@@ -37,6 +37,7 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 
 struct ClientActor {
     config: RuntimeConfig,
+    profile: Arc<dyn ProfileSource>,
     net: NetworkHandle,
     events: mpsc::Sender<ClientEvent>,
     transfers: mpsc::Sender<TransferWork>,
@@ -93,6 +94,7 @@ async fn run(
         searches: HashMap::new(),
         liked_interests: config.liked_interests,
         hated_interests: config.hated_interests,
+        profile: config.profile,
         config: config.runtime,
     };
 

@@ -3,6 +3,7 @@ mod common;
 use std::io::{Seek, SeekFrom, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc::Receiver;
@@ -13,15 +14,15 @@ use common::{
     upload_from,
 };
 use soulseek::client::{
-    Client, ClientBootstrap, ClientEvent, EnqueueResult, Observation, RetryResult, SearchScope,
-    TransferWork,
+    Client, ClientBootstrap, ClientEvent, EnqueueResult, Observation, ProfileRequest,
+    ProfileSource, RetryResult, SearchScope, TransferWork,
 };
 use soulseek::network::{NetworkCommand, NetworkEvent, NetworkHandle, spawn as spawn_network};
 use soulseek::protocol::PeerMessage;
 use soulseek::storage::SharedFolder;
 use soulseek::types::{
-    ConnectionType, DescriptionTemplate, FileAttributes, FileInfo, FolderContents, Restriction,
-    TransferDirection, TransferId, TransferSnapshot, TransferStatus,
+    ConnectionType, FileAttributes, FileInfo, FolderContents, Restriction, TransferDirection,
+    TransferId, TransferSnapshot, TransferStatus,
 };
 
 async fn wait<E, T>(events: &mut Receiver<E>, mut matcher: impl FnMut(E) -> Option<T>) -> T {
@@ -616,7 +617,20 @@ async fn restrictions_gate_uploads_and_actions_are_observed() {
 }
 
 #[tokio::test]
-async fn description_template_renders_for_the_asking_user() {
+async fn profile_source_receives_the_asking_users_state() {
+    struct ContractProfile;
+
+    impl ProfileSource for ContractProfile {
+        fn description(&self, request: &ProfileRequest<'_>) -> String {
+            format!(
+                "user={}, buddy={}, ban={}",
+                request.user_name,
+                request.user_is_buddy,
+                request.user_ban_reason.unwrap_or("none")
+            )
+        }
+    }
+
     let (server_addr, _registry) = start_fake_server().await;
 
     let share_dir = temp_dir();
@@ -624,37 +638,33 @@ async fn description_template_renders_for_the_asking_user() {
     std::fs::write(share_dir.join("Album").join("song.mp3"), b"payload").unwrap();
 
     let mut gina_config = sharing_config(server_addr, "gina", share_dir);
-    gina_config.runtime.description = DescriptionTemplate::parse(
-        "${user.is_buddy?Hey buddy:Hi} ${user.name}! ${me.name} shares ${me.shared_files} \
-         file in ${me.shared_folders} folders, ${me.free_slots}/${me.slots} slots free. 100$$",
-    )
-    .unwrap();
+    gina_config.profile = Arc::new(ContractProfile);
     let (gina, mut gina_events, _gina_transfers) = Client::spawn(gina_config);
     shares_installed(&mut gina_events).await;
 
     let (hank, mut hank_events, _hank_transfers) = login(server_addr, "hank").await;
 
-    async fn description(events: &mut Receiver<ClientEvent>) -> String {
+    async fn info(events: &mut Receiver<ClientEvent>) -> soulseek::client::UserInfoReceived {
         wait(events, |event| match event {
-            ClientEvent::UserInfo(info) if info.username == "gina" => Some(info.description),
+            ClientEvent::UserInfo(info) if info.username == "gina" => Some(info),
             _ => None,
         })
         .await
     }
 
-    hank.request_user_info("gina").await;
-    assert_eq!(
-        description(&mut hank_events).await,
-        "Hi hank! gina shares 1 file in 2 folders, 2/2 slots free. 100$"
-    );
-
     gina.add_buddy("hank").await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     hank.request_user_info("gina").await;
-    assert_eq!(
-        description(&mut hank_events).await,
-        "Hey buddy hank! gina shares 1 file in 2 folders, 2/2 slots free. 100$"
-    );
+    let received = info(&mut hank_events).await;
+    assert_eq!(received.description, "user=hank, buddy=true, ban=none");
+
+    gina.ban_user("hank").await;
+    hank.request_user_info("gina").await;
+    let received = info(&mut hank_events).await;
+    assert_eq!(received.description, "user=hank, buddy=true, ban=Banned");
+    assert_eq!(received.total_uploads, 0);
+    assert_eq!(received.queue_size, 0);
+    assert!(!received.slots_available);
 }
 
 #[tokio::test]
