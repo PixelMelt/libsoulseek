@@ -1,6 +1,6 @@
 # 32. Share rules live with the catalog and LocalShares
 
-Status: Accepted (supersedes ADR 0029 in part)
+Status: Accepted (supersedes ADR 0029 in part; refined by ADR 0036)
 Nicotine+: No counterpart
 
 ## Context

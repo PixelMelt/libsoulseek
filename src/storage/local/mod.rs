@@ -8,4 +8,5 @@ mod shares;
 
 pub use downloads::LocalDownloads;
 pub use folder::SharedFolder;
+pub use scan::ScanMode;
 pub use shares::LocalShares;

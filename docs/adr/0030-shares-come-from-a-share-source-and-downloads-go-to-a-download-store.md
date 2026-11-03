@@ -1,6 +1,6 @@
 # 30. Shares come from a ShareSource and downloads go to a DownloadStore
 
-Status: Accepted (refines ADR 0012, ADR 0014, ADR 0020, ADR 0021 and ADR 0025)
+Status: Accepted (refines ADR 0012, ADR 0014, ADR 0020, ADR 0021 and ADR 0025; refined by ADR 0035 and ADR 0036)
 Nicotine+: Diverges: Nicotine+ shares and downloads local files only; `LocalShares` and `LocalDownloads` keep its behaviour, and discarding a cleared download's partial matches its stale incomplete-file cleanup
 
 ## Context

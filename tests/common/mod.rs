@@ -11,7 +11,9 @@ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use soulseek::client::{ProfileRequest, ProfileSource};
 use soulseek::network::{OpenDownload, OpenUpload};
 use soulseek::protocol::MessageWriter;
-use soulseek::storage::{DownloadStore, LocalDownloads, LocalShares, ShareSource, SharedFolder};
+use soulseek::storage::{
+    DownloadStore, LocalDownloads, LocalShares, ScanMode, ShareFilters, ShareSource, SharedFolder,
+};
 use soulseek::types::{FileReader, FileWriter};
 
 pub struct FakeClient {
@@ -231,7 +233,15 @@ pub fn download_into(file: std::fs::File) -> OpenDownload {
 
 #[allow(dead_code)]
 pub fn local_shares(cache_dir: &Path, folders: Vec<SharedFolder>) -> Arc<dyn ShareSource> {
-    Arc::new(LocalShares::new(folders, Vec::new(), cache_dir.join("share-catalog.gz")).unwrap())
+    Arc::new(
+        LocalShares::new(
+            folders,
+            ShareFilters::new(Vec::new()).unwrap(),
+            cache_dir.join("share-catalog.gz"),
+            ScanMode::Full,
+        )
+        .unwrap(),
+    )
 }
 
 #[allow(dead_code)]

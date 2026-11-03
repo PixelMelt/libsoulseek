@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::files;
-use crate::storage::{Download, DownloadRequest, DownloadStore, OpenedDownload};
+use crate::storage::{
+    Download, DownloadRequest, DownloadStore, OpenedDownload, download_basename, download_folder,
+    incomplete_basename,
+};
 use crate::types::BoxFuture;
 
 #[derive(Debug, Clone)]
@@ -46,17 +49,15 @@ impl LocalDownloads {
 
 impl Dirs {
     fn incomplete_path(&self, download: &Download) -> PathBuf {
-        files::incomplete_file_path(
-            &self.incomplete_dir,
-            &download.username,
-            &download.virtual_path,
+        self.incomplete_dir.join(incomplete_basename(
+            download,
             files::basename_byte_limit(&self.incomplete_dir),
-        )
+        ))
     }
 }
 
 fn basename(destination: &Path, download: &Download) -> String {
-    files::download_basename(
+    download_basename(
         &download.virtual_path,
         files::basename_byte_limit(destination),
     )
@@ -76,15 +77,9 @@ fn blocking<T: Send + 'static>(
 
 impl DownloadStore for LocalDownloads {
     fn destination(&self, request: &DownloadRequest<'_>) -> String {
-        files::folder_destination(
-            &self.dirs.download_dir,
-            self.dirs.username_subfolders,
-            request.username,
-            request.virtual_path,
-            request.root,
-        )
-        .display()
-        .to_string()
+        let mut destination = self.dirs.download_dir.clone();
+        destination.extend(download_folder(request, self.dirs.username_subfolders));
+        destination.display().to_string()
     }
 
     fn existing(&self, downloads: Vec<Download>) -> BoxFuture<Vec<io::Result<Option<String>>>> {

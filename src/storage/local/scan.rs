@@ -3,15 +3,21 @@ use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::UNIX_EPOCH;
 
 use tracing::{info, warn};
 
 use super::SharedFolder;
 use super::audio::{has_audio_extension, is_missing_vbr, read_attributes};
-use crate::storage::{CatalogFile, ScanProgress, ShareCatalog};
+use crate::storage::{CatalogFile, ScanProgress, ShareCatalog, ShareFilters, escape_backslashes};
 use crate::types::FileAttributes;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanMode {
+    Full,
+    Fast,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum WalkError {
@@ -38,9 +44,7 @@ fn io_error<P: Into<PathBuf>>(
     }
 }
 
-const BACKSLASH_SENTINEL: &str = "@@BACKSLASH@@";
 const ATTRIBUTE_WORKER_CAP: usize = 12;
-const PROGRESS_INTERVAL: u64 = 1000;
 
 type AttributeCache<'a> = HashMap<&'a [u8], HashMap<&'a [u8], &'a CatalogFile>>;
 
@@ -49,26 +53,13 @@ pub(super) fn key_path(folder: &[u8], file: &[u8]) -> PathBuf {
 }
 
 struct Walk<'a> {
-    share_filters: HashSet<&'a str>,
+    filters: &'a ShareFilters,
+    mode: ScanMode,
     cache: AttributeCache<'a>,
-    progress: Progress<'a>,
+    progress: &'a ScanProgress,
     virtual_paths: HashSet<String>,
     catalog: ShareCatalog,
     misses: Vec<(u32, PathBuf)>,
-}
-
-struct Progress<'a> {
-    count: AtomicU64,
-    scan: &'a ScanProgress,
-}
-
-impl Progress<'_> {
-    fn add(&self) {
-        let count = self.count.fetch_add(1, Ordering::Relaxed) + 1;
-        if count.is_multiple_of(PROGRESS_INTERVAL) {
-            self.scan.files(count);
-        }
-    }
 }
 
 pub(super) fn restrict(catalog: &ShareCatalog, shared_folders: &[SharedFolder]) -> ShareCatalog {
@@ -107,8 +98,9 @@ pub(super) fn restrict(catalog: &ShareCatalog, shared_folders: &[SharedFolder]) 
 
 pub(super) fn walk(
     shared_folders: &[SharedFolder],
-    share_filters: &[String],
-    previous: Option<&ShareCatalog>,
+    filters: &ShareFilters,
+    mode: ScanMode,
+    previous: &ShareCatalog,
     progress: &ScanProgress,
 ) -> Result<ShareCatalog, WalkError> {
     let mut virtual_names = HashSet::new();
@@ -120,25 +112,22 @@ pub(super) fn walk(
         }
     }
     let cache = previous
-        .into_iter()
-        .flat_map(|catalog| {
-            catalog.folders().iter().map(|folder| {
-                let files = catalog
-                    .files(folder)
-                    .iter()
-                    .map(|file| (file.key(), file))
-                    .collect();
-                (folder.key(), files)
-            })
+        .folders()
+        .iter()
+        .map(|folder| {
+            let files = previous
+                .files(folder)
+                .iter()
+                .map(|file| (file.key(), file))
+                .collect();
+            (folder.key(), files)
         })
         .collect();
     let mut walk = Walk {
-        share_filters: share_filters.iter().map(String::as_str).collect(),
+        filters,
+        mode,
         cache,
-        progress: Progress {
-            count: AtomicU64::new(0),
-            scan: progress,
-        },
+        progress,
         virtual_paths: HashSet::new(),
         catalog: ShareCatalog::new(),
         misses: Vec::new(),
@@ -149,12 +138,11 @@ pub(super) fn walk(
     let Walk {
         mut catalog,
         misses,
-        progress: counter,
         ..
     } = walk;
 
     let attribute_reads = misses.len();
-    read_missing_attributes(&mut catalog, misses, &counter);
+    read_missing_attributes(&mut catalog, misses, progress);
     if progress.is_cancelled() {
         return Err(WalkError::Cancelled);
     }
@@ -175,7 +163,7 @@ impl Walk<'_> {
         let mut visited = HashSet::new();
         let mut stack = vec![(root.clone(), root, shared.virtual_name.clone())];
         while let Some((real_dir, canonical_dir, virtual_dir)) = stack.pop() {
-            if self.progress.scan.is_cancelled() {
+            if self.progress.is_cancelled() {
                 return Err(WalkError::Cancelled);
             }
             if visited.contains(&canonical_dir) {
@@ -195,7 +183,7 @@ impl Walk<'_> {
                 let entry = entry.map_err(io_error("scan folder", || &real_dir))?;
                 let real_name = entry.file_name();
                 let name = real_name.to_string_lossy().into_owned();
-                if name.starts_with('.') || self.share_filters.contains(name.as_str()) {
+                if self.filters.skips(&name) {
                     continue;
                 }
                 let entry_type = entry
@@ -213,7 +201,7 @@ impl Walk<'_> {
                     None
                 };
                 let file_type = target.as_ref().map_or(entry_type, fs::Metadata::file_type);
-                let name = name.replace('\\', BACKSLASH_SENTINEL);
+                let name = escape_backslashes(&name);
                 if file_type.is_dir() {
                     let canonical = if target.is_some() {
                         fs::canonicalize(entry.path()).map_err(io_error("stat", || entry.path()))?
@@ -251,20 +239,20 @@ impl Walk<'_> {
                         })
                         .map(|cached| cached.attributes().clone())
                 };
-                let known = attributes.is_some();
-                if known {
-                    self.progress.add();
+                let read = attributes.is_none() && self.mode == ScanMode::Full;
+                if !read {
+                    self.progress.add_file();
                 }
                 let attributes = attributes.unwrap_or_default();
                 files.push((
                     CatalogFile::new(name, real_name.into_vec(), size, mtime, attributes),
-                    known,
+                    read,
                 ));
             }
             files.sort_by(|(a, _), (b, _)| a.name().cmp(b.name()));
             let first_index = self.catalog.file_count();
-            for (offset, (file, known)) in files.iter().enumerate() {
-                if !known {
+            for (offset, (file, read)) in files.iter().enumerate() {
+                if *read {
                     let path = key_path(real_dir.as_os_str().as_bytes(), file.key());
                     self.misses.push(((first_index + offset) as u32, path));
                 }
@@ -286,7 +274,7 @@ impl Walk<'_> {
 fn read_missing_attributes(
     catalog: &mut ShareCatalog,
     misses: Vec<(u32, PathBuf)>,
-    progress: &Progress,
+    progress: &ScanProgress,
 ) {
     if misses.is_empty() {
         return;
@@ -303,13 +291,13 @@ fn read_missing_attributes(
         for _ in 0..workers {
             let results = results.clone();
             scope.spawn(move || {
-                while !progress.scan.is_cancelled() {
+                while !progress.is_cancelled() {
                     let position = cursor.fetch_add(1, Ordering::Relaxed);
                     let Some((file_index, path)) = misses.get(position) else {
                         break;
                     };
                     let attributes = read_attributes(path);
-                    progress.add();
+                    progress.add_file();
                     results.send((*file_index, attributes)).unwrap();
                 }
             });
@@ -332,7 +320,7 @@ fn unix_mtime(metadata: &fs::Metadata) -> u64 {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
 
     use super::*;
     use crate::storage::CatalogFolder;
@@ -342,17 +330,23 @@ mod tests {
         ScanProgress::new(Arc::new(AtomicBool::new(cancelled)), |_| {})
     }
 
+    fn filters(names: &[&str]) -> ShareFilters {
+        ShareFilters::new(names.iter().map(|name| (*name).to_owned()).collect()).unwrap()
+    }
+
     fn scan(
         shared_folders: &[SharedFolder],
-        share_filters: &[String],
+        filters: &ShareFilters,
+        mode: ScanMode,
         cache_path: &Path,
         cancelled: bool,
     ) -> Result<ShareCatalog, WalkError> {
         let previous = cache::load(cache_path);
         let catalog = walk(
             shared_folders,
-            share_filters,
-            Some(&previous),
+            filters,
+            mode,
+            &previous,
             &progress(cancelled),
         )?;
         cache::save(cache_path, &catalog);
@@ -368,7 +362,11 @@ mod tests {
     }
 
     fn scan_music(path: PathBuf, cache_path: &Path) -> ShareCatalog {
-        scan(&music_share(path), &[], cache_path, false).unwrap()
+        scan_music_as(ScanMode::Full, path, cache_path)
+    }
+
+    fn scan_music_as(mode: ScanMode, path: PathBuf, cache_path: &Path) -> ShareCatalog {
+        scan(&music_share(path), &filters(&[]), mode, cache_path, false).unwrap()
     }
 
     fn folder<'a>(catalog: &'a ShareCatalog, virtual_path: &str) -> Option<&'a CatalogFolder> {
@@ -502,7 +500,14 @@ mod tests {
     #[test]
     fn shares_scan_into_virtual_folders_with_their_buddy_flags() {
         let base = temp_base();
-        let catalog = scan(&test_shares(&base), &[], &cache_path(&base), false).unwrap();
+        let catalog = scan(
+            &test_shares(&base),
+            &filters(&[]),
+            ScanMode::Full,
+            &cache_path(&base),
+            false,
+        )
+        .unwrap();
 
         let (path, file) = lookup(&catalog, "Public\\Sample Album\\First Song.flac").unwrap();
         assert_eq!(file.size(), 300);
@@ -559,6 +564,37 @@ mod tests {
     }
 
     #[test]
+    fn fast_scans_leave_attributes_unknown_and_keep_cached_ones() {
+        let base = temp_base();
+        let dir = base.join("music");
+        fs::create_dir_all(&dir).unwrap();
+        write_wav(&dir.join("tone.wav"));
+        let cache_path = cache_path(&base);
+        let attributes = |mode| {
+            let catalog = scan_music_as(mode, dir.clone(), &cache_path);
+            lookup(&catalog, "Music\\tone.wav")
+                .unwrap()
+                .1
+                .attributes()
+                .clone()
+        };
+
+        assert_eq!(attributes(ScanMode::Fast), FileAttributes::default());
+        assert_eq!(
+            cached_attributes(&cache_path, &dir, "tone.wav"),
+            FileAttributes::default()
+        );
+
+        let read = attributes(ScanMode::Full);
+        assert_eq!(read.sample_rate, Some(44100));
+        assert_eq!(read.bit_depth, Some(16));
+        assert_eq!(read.length, Some(1));
+
+        assert_eq!(attributes(ScanMode::Fast), read);
+        assert_eq!(cached_attributes(&cache_path, &dir, "tone.wav"), read);
+    }
+
+    #[test]
     fn cache_hit_skips_reading_attributes() {
         let (dir, cache_path) = cached_song("song.flac", 0, Some(0));
 
@@ -586,7 +622,14 @@ mod tests {
     fn restrict_applies_the_share_configuration_to_a_cached_catalog() {
         let base = temp_base();
         let shares = test_shares(&base);
-        let catalog = walk(&shares, &[], None, &progress(false)).unwrap();
+        let catalog = walk(
+            &shares,
+            &filters(&[]),
+            ScanMode::Full,
+            &ShareCatalog::new(),
+            &progress(false),
+        )
+        .unwrap();
         assert_eq!(catalog.folders().len(), 3);
 
         let public_only = restrict(&catalog, &shares[..1]);
@@ -622,26 +665,6 @@ mod tests {
     }
 
     #[test]
-    fn progress_notifies_every_interval() {
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let scan = ScanProgress::new(Arc::new(AtomicBool::new(false)), {
-            let seen = seen.clone();
-            move |count| seen.lock().unwrap().push(count)
-        });
-        let progress = Progress {
-            count: AtomicU64::new(0),
-            scan: &scan,
-        };
-        for _ in 0..(PROGRESS_INTERVAL * 2 + 1) {
-            progress.add();
-        }
-        assert_eq!(
-            *seen.lock().unwrap(),
-            vec![PROGRESS_INTERVAL, PROGRESS_INTERVAL * 2]
-        );
-    }
-
-    #[test]
     fn share_filters_skip_exact_names() {
         let base = temp_base();
         let dir = base.join("music");
@@ -653,7 +676,8 @@ mod tests {
 
         let catalog = scan(
             &music_share(dir),
-            &["Thumbs.db".into(), "Covers".into()],
+            &filters(&["Thumbs.db", "Covers"]),
+            ScanMode::Full,
             &cache_path(&base),
             false,
         )
@@ -683,7 +707,13 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("song.mp3"), b"g".repeat(300)).unwrap();
 
-        let result = scan(&music_share(dir), &[], &cache_path(&base), true);
+        let result = scan(
+            &music_share(dir),
+            &filters(&[]),
+            ScanMode::Full,
+            &cache_path(&base),
+            true,
+        );
         assert!(matches!(result, Err(WalkError::Cancelled)));
     }
 

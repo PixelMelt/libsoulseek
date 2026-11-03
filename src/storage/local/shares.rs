@@ -4,10 +4,13 @@ use std::sync::Arc;
 
 use tokio::io::AsyncSeekExt;
 
-use super::SharedFolder;
 use super::cache;
 use super::scan::{self, WalkError, key_path};
-use crate::storage::{OpenedShare, ScanError, ScanProgress, ShareCatalog, ShareKey, ShareSource};
+use super::{ScanMode, SharedFolder};
+use crate::storage::{
+    OpenedShare, ScanError, ScanProgress, ShareCatalog, ShareFilters, ShareKey, ShareSource,
+    check_share_name,
+};
 use crate::types::BoxFuture;
 
 #[derive(Debug, Clone)]
@@ -18,38 +21,27 @@ pub struct LocalShares {
 #[derive(Debug)]
 struct Config {
     folders: Vec<SharedFolder>,
-    filters: Vec<String>,
+    filters: ShareFilters,
     cache: PathBuf,
+    mode: ScanMode,
 }
 
 impl LocalShares {
     pub fn new(
         folders: Vec<SharedFolder>,
-        filters: Vec<String>,
+        filters: ShareFilters,
         cache: PathBuf,
+        mode: ScanMode,
     ) -> Result<Self, String> {
         for share in &folders {
-            if share.virtual_name.is_empty() || share.virtual_name.contains(['/', '\\']) {
-                return Err(format!(
-                    "share name {:?} is invalid: remote clients rewrite slashes in \
-                     virtual paths and their download requests would no longer match",
-                    share.virtual_name
-                ));
-            }
-        }
-        for filter in &filters {
-            if filter.is_empty() || filter.contains(['/', '\\']) {
-                return Err(format!(
-                    "share filter {filter:?} is invalid: filters match exact file or \
-                     folder names and cannot be empty or contain path separators"
-                ));
-            }
+            check_share_name(&share.virtual_name)?;
         }
         Ok(Self {
             config: Arc::new(Config {
                 folders,
                 filters,
                 cache,
+                mode,
             }),
         })
     }
@@ -91,11 +83,17 @@ impl ShareSource for LocalShares {
                 return Ok(ShareCatalog::new());
             }
             let cached = cache::load(&config.cache);
-            let catalog = scan::walk(&config.folders, &config.filters, Some(&cached), &progress)
-                .map_err(|error| match error {
-                    WalkError::Cancelled => ScanError::Superseded,
-                    error => ScanError::Source(Box::new(error)),
-                })?;
+            let catalog = scan::walk(
+                &config.folders,
+                &config.filters,
+                config.mode,
+                &cached,
+                &progress,
+            )
+            .map_err(|error| match error {
+                WalkError::Cancelled => ScanError::Superseded,
+                error => ScanError::Source(Box::new(error)),
+            })?;
             drop(cached);
             cache::save(&config.cache, &catalog);
             Ok(catalog)
@@ -130,36 +128,16 @@ mod tests {
 
     use super::*;
 
+    fn no_filters() -> ShareFilters {
+        ShareFilters::new(Vec::new()).unwrap()
+    }
+
     fn share(virtual_name: &str, path: PathBuf) -> SharedFolder {
         SharedFolder {
             virtual_name: virtual_name.into(),
             path,
             buddy_only: false,
         }
-    }
-
-    #[test]
-    fn share_names_and_filters_follow_the_protocol_rules() {
-        let with = |name: &str, filter: &str| {
-            LocalShares::new(
-                vec![share(name, PathBuf::from("/data/shared"))],
-                vec![filter.into()],
-                PathBuf::from("/data/catalog.gz"),
-            )
-        };
-        for name in ["/", "a/b", "a\\b", ""] {
-            assert!(
-                with(name, "Thumbs.db").is_err(),
-                "{name:?} must be rejected"
-            );
-        }
-        for filter in ["", "a/b", "a\\b"] {
-            assert!(
-                with("Music", filter).is_err(),
-                "{filter:?} must be rejected"
-            );
-        }
-        assert!(with("Music", "desktop.ini").is_ok());
     }
 
     #[tokio::test]
@@ -171,8 +149,9 @@ mod tests {
         std::fs::write(base.join("music/song.mp3"), b"0123456789").unwrap();
         let source = LocalShares::new(
             vec![share("Music", base.join("music"))],
-            Vec::new(),
+            no_filters(),
             base.join("catalog.gz"),
+            ScanMode::Full,
         )
         .unwrap();
 
@@ -213,8 +192,9 @@ mod tests {
         let scan_as = |name: &str| {
             LocalShares::new(
                 vec![share(name, base.join("music"))],
-                Vec::new(),
+                no_filters(),
                 catalog.clone(),
+                ScanMode::Full,
             )
             .unwrap()
         };

@@ -886,7 +886,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::storage::{CatalogFile, LocalShares, ShareCatalog};
+    use crate::storage::{CatalogFile, LocalShares, ScanMode, ShareCatalog, ShareFilters};
     use tokio::sync::mpsc;
 
     const TRACKS: [&str; 3] = ["Music\\a.mp3", "Music\\b.mp3", "Music\\c.mp3"];
@@ -900,8 +900,15 @@ mod tests {
         for name in names {
             std::fs::write(dir.join(name), PAYLOAD).unwrap();
         }
-        let source: Arc<dyn ShareSource> =
-            Arc::new(LocalShares::new(Vec::new(), Vec::new(), dir.join("catalog.gz")).unwrap());
+        let source: Arc<dyn ShareSource> = Arc::new(
+            LocalShares::new(
+                Vec::new(),
+                ShareFilters::new(Vec::new()).unwrap(),
+                dir.join("catalog.gz"),
+                ScanMode::Full,
+            )
+            .unwrap(),
+        );
         let mut catalog = ShareCatalog::new();
         catalog
             .push_folder(
