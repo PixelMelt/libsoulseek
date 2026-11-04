@@ -1,6 +1,6 @@
 # 11. Resource bounds are explicit constants, not configuration
 
-Status: Accepted
+Status: Accepted (refined by ADR 0037)
 Nicotine+: No counterpart
 
 ## Context

@@ -20,7 +20,7 @@ Records 0001 to 0028 began in newkitine and were renumbered here. newkitine's in
 | [0008](0008-reconnect-backoff.md) | Reconnect backoff: 5 s base + 0–10 s jitter, doubling to a 300 s cap | Accepted | Matches in shape: Nicotine+ picks a random 5–15 s, then doubles to 300 s |
 | [0009](0009-known-deliberate-protocol-divergences-from-nicotine.md) | Known-deliberate protocol divergences from Nicotine+ | Accepted | Diverges (listed below) |
 | [0010](0010-transfers-are-actor-authoritative.md) | Transfers are actor-authoritative; the consumer's store is a projection of them | Accepted | No counterpart |
-| [0011](0011-resource-bounds-are-explicit-constants-not-configuration.md) | Resource bounds are explicit constants, not configuration | Accepted | No counterpart |
+| [0011](0011-resource-bounds-are-explicit-constants-not-configuration.md) | Resource bounds are explicit constants, not configuration | Accepted (refined by ADR 0037) | No counterpart |
 | [0012](0012-download-placement-on-blocking-worker.md) | Download placement runs on a blocking worker with a Placing phase | Accepted (refined by ADR 0030 and ADR 0031) | No counterpart |
 | [0013](0013-the-share-catalog-cache-is-fail-open-by-design.md) | The share catalog cache is fail-open by design | Accepted | Matches: Nicotine+ rescans when its share databases fail to load |
 | [0014](0014-scan-lifecycle-vocabulary.md) | Scan lifecycle vocabulary | Accepted (refined by ADR 0030) | No counterpart |
@@ -46,3 +46,4 @@ Records 0001 to 0028 began in newkitine and were renumbered here. newkitine's in
 | [0034](0034-a-file-denial-carries-the-consumers-reason.md) | A file denial carries the consumer's reason | Accepted (refines ADR 0022) | No counterpart |
 | [0035](0035-a-fast-scan-lists-shares-without-reading-their-files.md) | A fast scan lists shares without reading their files | Accepted (refines ADR 0030) | Diverges: Nicotine+ always reads the audio attributes of new and changed files; `ScanMode::Full` keeps that behaviour |
 | [0036](0036-share-rules-and-download-naming-are-public-so-every-store-applies-the-same-policy.md) | Share rules and download naming are public so every store applies the same policy | Accepted (refines ADR 0030 and ADR 0032) | No counterpart: Nicotine+ has local storage only; the rules themselves are unchanged |
+| [0037](0037-the-network-raises-the-open-file-limit-and-caps-its-sockets.md) | The network raises the open file limit and caps its sockets | Accepted (refines ADR 0011) | Matches the socket cap; diverges in only ever raising the soft file limit |

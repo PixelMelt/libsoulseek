@@ -2,6 +2,7 @@ mod actor;
 mod api;
 mod codec;
 mod conn;
+mod file_limit;
 
 use tokio::sync::mpsc;
 
@@ -62,7 +63,9 @@ pub(crate) fn test_channel() -> (NetworkHandle, mpsc::Receiver<NetworkCommand>) 
 pub fn spawn() -> (NetworkHandle, mpsc::Receiver<NetworkEvent>) {
     let (commands_tx, commands_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
     let (events_tx, events_rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
-    tokio::spawn(actor::Actor::new(commands_rx, events_tx).run());
+    let max_sockets = file_limit::raise_file_limit();
+    tracing::debug!(max_sockets, "maximum concurrent connections");
+    tokio::spawn(actor::Actor::new(commands_rx, events_tx, max_sockets).run());
     (
         NetworkHandle {
             commands: commands_tx,

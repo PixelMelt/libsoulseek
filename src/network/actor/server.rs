@@ -322,6 +322,7 @@ impl Actor {
         }
         self.server.listener = None;
         self.peers.close_all();
+        self.pending_outgoing.clear();
         self.indirect.reset();
         self.distributed.reset();
         self.allowed.write().unwrap().clear();

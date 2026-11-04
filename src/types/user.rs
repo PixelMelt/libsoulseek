@@ -46,6 +46,15 @@ pub struct UserStats {
     pub files: u32,
     pub dirs: u32,
 }
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UserData {
+    pub username: String,
+    pub status: u32,
+    pub stats: UserStats,
+    pub slotsfull: u32,
+    pub country: Option<String>,
+}
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SimilarUser {
     pub username: String,

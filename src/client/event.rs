@@ -1,6 +1,8 @@
 use std::net::Ipv4Addr;
 
-use crate::types::{FileInfo, FolderContents, Recommendations, SimilarUser, UserStats, UserStatus};
+use crate::types::{
+    FileInfo, FolderContents, Recommendations, SimilarUser, UserData, UserStats, UserStatus,
+};
 
 use super::observation::Observation;
 
@@ -106,14 +108,14 @@ pub enum ClientEvent {
     },
     RoomJoined {
         room: String,
-        users: Vec<String>,
+        users: Vec<UserData>,
     },
     RoomLeft {
         room: String,
     },
     RoomUserJoined {
         room: String,
-        username: String,
+        user: UserData,
     },
     RoomUserLeft {
         room: String,

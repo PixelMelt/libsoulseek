@@ -160,10 +160,15 @@ pub enum ConnEvent {
         conn_id: ConnId,
         init: PeerInitMessage,
         addr: SocketAddr,
+        received_through: u64,
     },
     Peer {
         conn_id: ConnId,
         message: PeerMessage,
+        received_through: u64,
+    },
+    Consumed {
+        conn_id: ConnId,
         received_through: u64,
     },
     Unsent {
