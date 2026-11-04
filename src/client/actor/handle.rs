@@ -92,6 +92,11 @@ impl Client {
         self.run(move |actor| actor.cancel_search(token)).await;
     }
 
+    pub async fn stop_search_results(&self, token: u32) {
+        self.run(move |actor| actor.stop_search_results(token))
+            .await;
+    }
+
     pub async fn download(
         &self,
         username: &str,
