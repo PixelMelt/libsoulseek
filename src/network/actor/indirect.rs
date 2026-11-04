@@ -6,7 +6,7 @@ use tokio::time::Instant;
 use tracing::debug;
 
 use super::Actor;
-use super::peers::PeerIdentity;
+use super::peers::{Outgoing, PeerIdentity};
 use crate::network::ConnId;
 use crate::network::NetworkEvent;
 use crate::network::conn::ConnControl;
@@ -194,7 +194,7 @@ impl Indirect {
         }
     }
 
-    fn set_conn(&mut self, init_id: InitId, conn_id: ConnId) {
+    pub(super) fn set_conn(&mut self, init_id: InitId, conn_id: ConnId) {
         let previous = self
             .inits
             .get_mut(&init_id)
@@ -353,13 +353,16 @@ impl Actor {
         let init = self.indirect.get(init_id).unwrap();
         let username = init.username.clone();
         let conn_type = init.conn_type;
-        let first_message = PeerInitMessage::PeerInit {
-            username: server_username,
+        self.connect_peer(Outgoing {
+            addr,
+            username,
+            first_message: PeerInitMessage::PeerInit {
+                username: server_username,
+                conn_type,
+            },
             conn_type,
-        };
-        let conn_id =
-            self.spawn_outgoing_peer(addr, username, first_message, conn_type, Some(init_id));
-        self.indirect.set_conn(init_id, conn_id);
+            init_id: Some(init_id),
+        });
     }
 
     pub(super) fn flush_init_queue(&mut self, init_id: InitId) {
@@ -490,18 +493,15 @@ impl Actor {
             self.indirect
                 .insert(username.clone(), conn_type, None, Vec::new())
         });
-        let conn_id = self.spawn_outgoing_peer(
+        self.connect_peer(Outgoing {
             addr,
             username,
-            PeerInitMessage::PierceFireWall {
+            first_message: PeerInitMessage::PierceFireWall {
                 token: pierce_token,
             },
             conn_type,
             init_id,
-        );
-        if let Some(init_id) = init_id {
-            self.indirect.set_conn(init_id, conn_id);
-        }
+        });
     }
 
     pub(super) fn handle_peer_address(&mut self, user: &str, ip_address: Ipv4Addr, port: u32) {
@@ -529,6 +529,7 @@ impl Actor {
         conn_id: ConnId,
         init: PeerInitMessage,
         addr: SocketAddr,
+        received_through: u64,
     ) {
         match init {
             PeerInitMessage::PeerInit {
@@ -547,6 +548,7 @@ impl Actor {
                     username: username.clone(),
                     conn_type,
                 });
+                conn.received_through = received_through;
                 debug!(username, ?conn_type, %addr, "incoming direct connection");
 
                 if conn_type != ConnectionType::File
@@ -592,6 +594,7 @@ impl Actor {
                     username: username.clone(),
                     conn_type,
                 });
+                conn.received_through = received_through;
                 if direct_established {
                     debug!(
                         username,

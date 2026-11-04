@@ -30,6 +30,15 @@ pub(super) struct Conn {
     pub(super) ip: Option<Ipv4Addr>,
     traffic: SharedTraffic,
     sends_pushed: u64,
+    pub(super) received_through: u64,
+}
+
+pub(super) struct Outgoing {
+    pub(super) addr: SocketAddrV4,
+    pub(super) username: String,
+    pub(super) first_message: PeerInitMessage,
+    pub(super) conn_type: ConnectionType,
+    pub(super) init_id: Option<InitId>,
 }
 
 impl Conn {
@@ -45,6 +54,7 @@ impl Conn {
             ip: None,
             traffic: SharedTraffic::default(),
             sends_pushed: 0,
+            received_through: 0,
         }
     }
 
@@ -56,9 +66,16 @@ impl Conn {
             .username
     }
 
-    fn is_quiescent(&self, received_through: u64) -> bool {
-        self.traffic.received() == received_through
+    fn is_quiescent(&self) -> bool {
+        self.traffic.received() == self.received_through
             && self.traffic.sends_written() == self.sends_pushed
+    }
+
+    fn is_critical(&self, own_username: Option<&str>) -> bool {
+        self.identity.as_ref().is_some_and(|identity| {
+            identity.conn_type != ConnectionType::Peer
+                || Some(identity.username.as_str()) == own_username
+        })
     }
 }
 
@@ -111,6 +128,16 @@ impl Peers {
 
     pub(super) fn count(&self) -> usize {
         self.conns.len()
+    }
+
+    fn inactive(&self, own_username: Option<&str>) -> Vec<ConnId> {
+        self.conns
+            .iter()
+            .filter(|(_, conn)| {
+                conn.established && !conn.is_critical(own_username) && conn.is_quiescent()
+            })
+            .map(|(conn_id, _)| *conn_id)
+            .collect()
     }
 
     pub(super) fn close_all(&mut self) {
@@ -197,6 +224,7 @@ impl Actor {
             ip,
             traffic: traffic.clone(),
             sends_pushed: 0,
+            received_through: 0,
         });
         self.emit(NetworkEvent::ConnectionCount(self.peers.count()));
         PeerTask {
@@ -225,14 +253,50 @@ impl Actor {
         super::spawn_conn_task("incoming peer", run_incoming_peer(task, stream, addr));
     }
 
-    pub(super) fn spawn_outgoing_peer(
-        &mut self,
-        addr: SocketAddrV4,
-        username: String,
-        first_message: PeerInitMessage,
-        conn_type: ConnectionType,
-        init_id: Option<InitId>,
-    ) -> ConnId {
+    fn sockets(&self) -> usize {
+        self.peers.count()
+            + usize::from(self.server.listener.is_some())
+            + usize::from(self.server.is_connected())
+    }
+
+    pub(super) fn has_free_socket(&self) -> bool {
+        self.sockets() < self.max_sockets
+    }
+
+    pub(super) fn check_socket_limit(&mut self) {
+        if !self.has_free_socket() {
+            for conn_id in self.peers.inactive(self.server.username()) {
+                self.close_conn(conn_id);
+            }
+        }
+        self.connect_pending();
+    }
+
+    pub(super) fn connect_pending(&mut self) {
+        for outgoing in std::mem::take(&mut self.pending_outgoing) {
+            let wanted = outgoing.init_id.is_none_or(|init_id| {
+                self.indirect
+                    .get(init_id)
+                    .is_some_and(|init| init.conn_id.is_none())
+            });
+            if wanted {
+                self.connect_peer(outgoing);
+            }
+        }
+    }
+
+    pub(super) fn connect_peer(&mut self, outgoing: Outgoing) {
+        if !self.has_free_socket() {
+            self.pending_outgoing.push(outgoing);
+            return;
+        }
+        let Outgoing {
+            addr,
+            username,
+            first_message,
+            conn_type,
+            init_id,
+        } = outgoing;
         let pierce_token = match first_message {
             PeerInitMessage::PierceFireWall { token } => Some(token),
             _ => None,
@@ -259,7 +323,9 @@ impl Actor {
                 conn_type,
             ),
         );
-        conn_id
+        if let Some(init_id) = init_id {
+            self.indirect.set_conn(init_id, conn_id);
+        }
     }
 
     pub(super) fn handle_established(&mut self, conn_id: ConnId) {
@@ -302,16 +368,23 @@ impl Actor {
         message: PeerMessage,
         received_through: u64,
     ) {
-        let Some(conn) = self.peers.get(conn_id) else {
+        let Some(conn) = self.peers.get_mut(conn_id) else {
             return;
         };
+        conn.received_through = received_through;
         let username = conn.username().to_owned();
         let close_after = matches!(message, PeerMessage::FileSearchResponse { .. })
             && self.server.username() != Some(username.as_str())
-            && conn.is_quiescent(received_through);
+            && conn.is_quiescent();
         self.emit(NetworkEvent::PeerMessage { username, message });
         if close_after {
             self.close_conn(conn_id);
+        }
+    }
+
+    pub(super) fn handle_consumed(&mut self, conn_id: ConnId, received_through: u64) {
+        if let Some(conn) = self.peers.get_mut(conn_id) {
+            conn.received_through = received_through;
         }
     }
 
@@ -357,5 +430,93 @@ impl Actor {
             }
             ConnectionType::Peer => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::network::conn::ConnEvent;
+
+    fn actor(max_sockets: usize) -> (Actor, mpsc::Receiver<NetworkEvent>) {
+        let (_commands_tx, commands) = mpsc::channel(8);
+        let (events_tx, events) = mpsc::channel(64);
+        (Actor::new(commands, events_tx, max_sockets), events)
+    }
+
+    fn conn(
+        actor: &mut Actor,
+        username: &str,
+        conn_type: ConnectionType,
+    ) -> (ConnId, mpsc::Receiver<ConnControl>) {
+        let (control, rx) = mpsc::channel(8);
+        let conn_id = actor.peers.add(Conn::established(
+            control,
+            PeerIdentity {
+                username: username.to_owned(),
+                conn_type,
+            },
+        ));
+        (conn_id, rx)
+    }
+
+    fn closed(rx: &mut mpsc::Receiver<ConnControl>) -> bool {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|control| matches!(control, ConnControl::Close))
+    }
+
+    fn outgoing(init_id: Option<InitId>) -> Outgoing {
+        Outgoing {
+            addr: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9),
+            username: "peer".into(),
+            first_message: PeerInitMessage::PierceFireWall { token: 1 },
+            conn_type: ConnectionType::File,
+            init_id,
+        }
+    }
+
+    #[test]
+    fn at_the_socket_limit_idle_peer_connections_close() {
+        let (mut actor, _events) = actor(3);
+        let (_, mut idle) = conn(&mut actor, "idle", ConnectionType::Peer);
+        let (_, mut file) = conn(&mut actor, "file", ConnectionType::File);
+        let (busy_id, mut busy) = conn(&mut actor, "busy", ConnectionType::Peer);
+        actor.peers.get_mut(busy_id).unwrap().sends_pushed = 1;
+
+        actor.check_socket_limit();
+
+        assert!(closed(&mut idle));
+        assert!(!closed(&mut file));
+        assert!(!closed(&mut busy));
+    }
+
+    #[test]
+    fn below_the_socket_limit_idle_connections_stay_open() {
+        let (mut actor, _events) = actor(2);
+        let (_, mut idle) = conn(&mut actor, "idle", ConnectionType::Peer);
+
+        actor.check_socket_limit();
+
+        assert!(!closed(&mut idle));
+    }
+
+    #[tokio::test]
+    async fn connections_wait_for_a_free_socket() {
+        let (mut actor, _events) = actor(1);
+        let (busy_id, _busy) = conn(&mut actor, "busy", ConnectionType::File);
+
+        actor.connect_peer(outgoing(None));
+        actor.connect_peer(outgoing(Some(99)));
+        assert_eq!(actor.pending_outgoing.len(), 2);
+        assert_eq!(actor.peers.count(), 1);
+
+        actor.handle_conn_event(ConnEvent::Closed {
+            conn_id: busy_id,
+            error: None,
+        });
+
+        assert!(actor.pending_outgoing.is_empty());
+        assert_eq!(actor.peers.count(), 1);
+        assert!(!actor.peers.contains(busy_id));
     }
 }

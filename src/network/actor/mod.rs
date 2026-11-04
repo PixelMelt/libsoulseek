@@ -16,7 +16,7 @@ use crate::types::ConnectionType;
 
 use distributed::Distributed;
 use indirect::{Indirect, QueuedItem};
-use peers::Peers;
+use peers::{Outgoing, Peers};
 use server::Server;
 
 pub(super) fn spawn_conn_task(name: &'static str, task: impl Future<Output = ()> + Send + 'static) {
@@ -44,6 +44,8 @@ pub struct Actor {
     allowed: SharedAllowed,
     banned_addresses: Vec<String>,
     limits: SharedLimits,
+    max_sockets: usize,
+    pending_outgoing: Vec<Outgoing>,
     server: Server,
     peers: Peers,
     indirect: Indirect,
@@ -54,6 +56,7 @@ impl Actor {
     pub fn new(
         commands: mpsc::Receiver<NetworkCommand>,
         events: mpsc::Sender<NetworkEvent>,
+        max_sockets: usize,
     ) -> Self {
         let (conn_events_tx, conn_events) = mpsc::channel(CONN_EVENT_QUEUE_CAPACITY);
         Self {
@@ -64,6 +67,8 @@ impl Actor {
             allowed: Arc::default(),
             banned_addresses: Vec::new(),
             limits: Arc::default(),
+            max_sockets,
+            pending_outgoing: Vec::new(),
             server: Server::new(),
             peers: Peers::new(),
             indirect: Indirect::new(),
@@ -90,12 +95,14 @@ impl Actor {
                         event.expect("conn event channel closed while the actor holds the sender");
                     self.handle_conn_event(event);
                 }
-                accepted = server::accept(&self.server.listener, self.server.accept_resumes_at) => {
+                accepted = server::accept(&self.server.listener, self.server.accept_resumes_at),
+                    if self.has_free_socket() => {
                     self.handle_accept(accepted);
                 }
                 _ = sweep.tick() => {
                     self.sweep_indirect_requests();
                     self.check_login_timeout();
+                    self.check_socket_limit();
                 }
                 _ = ping.tick() => {
                     if self.server.is_logged_in() {
@@ -215,20 +222,28 @@ impl Actor {
                 conn_id,
                 init,
                 addr,
+                received_through,
             } => {
-                self.handle_incoming_init(conn_id, init, addr);
+                self.handle_incoming_init(conn_id, init, addr, received_through);
             }
             ConnEvent::Peer {
                 conn_id,
                 message,
                 received_through,
             } => self.handle_peer_message(conn_id, message, received_through),
+            ConnEvent::Consumed {
+                conn_id,
+                received_through,
+            } => self.handle_consumed(conn_id, received_through),
             ConnEvent::Unsent { username, messages } => self.emit_unsent(username, messages),
             ConnEvent::Distrib { conn_id, message } => {
                 self.handle_distrib_message(conn_id, message);
             }
             ConnEvent::File { conn_id, event } => self.handle_file_event(conn_id, event),
-            ConnEvent::Closed { conn_id, error } => self.handle_conn_closed(conn_id, error),
+            ConnEvent::Closed { conn_id, error } => {
+                self.handle_conn_closed(conn_id, error);
+                self.connect_pending();
+            }
         }
     }
 

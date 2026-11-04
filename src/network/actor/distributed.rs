@@ -401,7 +401,7 @@ mod tests {
         fn new() -> Self {
             let (commands_tx, commands) = mpsc::channel(8);
             let (events_tx, events) = mpsc::channel(64);
-            let mut actor = Actor::new(commands, events_tx);
+            let mut actor = Actor::new(commands, events_tx, 2048);
             actor.distributed.max_distrib_children = 10;
             Self {
                 actor,

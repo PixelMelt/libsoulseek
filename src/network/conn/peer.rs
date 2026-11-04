@@ -109,6 +109,7 @@ pub async fn run_incoming_peer(mut task: PeerTask, stream: TcpStream, addr: Sock
             conn_id: task.conn_id,
             init,
             addr,
+            received_through: consumed(&reader),
         })
         .await
         .is_err()
@@ -279,14 +280,24 @@ async fn read_peer_frames(
         };
         received_through += 4 + size as u64;
 
+        let consumed = ConnEvent::Consumed {
+            conn_id,
+            received_through,
+        };
         match PeerMessage::response_header(code, &payload) {
             Ok(Some(header)) if !is_response_allowed(&allowed, &username, &header) => {
                 debug!(code, username, "dropping unsolicited peer response");
+                if frames.send(Ok(consumed)).await.is_err() {
+                    return;
+                }
                 continue;
             }
             Ok(_) => {}
             Err(error) => {
                 debug!(code, %error, "dropping unparsable peer response header");
+                if frames.send(Ok(consumed)).await.is_err() {
+                    return;
+                }
                 continue;
             }
         }
@@ -298,18 +309,19 @@ async fn read_peer_frames(
         } else {
             PeerMessage::parse(code, &payload)
         };
-        match parsed {
-            Ok(message) => {
-                let event = ConnEvent::Peer {
-                    conn_id,
-                    message,
-                    received_through,
-                };
-                if frames.send(Ok(event)).await.is_err() {
-                    return;
-                }
+        let event = match parsed {
+            Ok(message) => ConnEvent::Peer {
+                conn_id,
+                message,
+                received_through,
+            },
+            Err(error) => {
+                debug!(code, %error, "dropping unparsable peer message");
+                consumed
             }
-            Err(error) => debug!(code, %error, "dropping unparsable peer message"),
+        };
+        if frames.send(Ok(event)).await.is_err() {
+            return;
         }
     };
     let _ = frames.send(Err(fatal)).await;
