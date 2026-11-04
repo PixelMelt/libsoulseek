@@ -175,16 +175,23 @@ async fn run_typed_loop(
     traffic.touch();
     let mut deadline = traffic.last_active() + PEER_IDLE_TIMEOUT;
     let mut unsent = Vec::new();
+    let mut pending = None;
     let error = loop {
         tokio::select! {
-            frame = frames.recv() => {
-                let event = match frame {
-                    Some(Ok(event)) => event,
+            frame = frames.recv(), if pending.is_none() => {
+                match frame {
+                    Some(Ok(event)) => pending = Some(event),
                     Some(Err(error)) => break error,
                     None => break Some("connection closed".into()),
-                };
-                if events.send(event).await.is_err() {
-                    break None;
+                }
+            }
+            reserved = events.reserve(), if pending.is_some() => {
+                match reserved {
+                    Ok(permit) => {
+                        permit.send(pending.take().expect("reserved without a pending event"));
+                        traffic.touch();
+                    }
+                    Err(_) => break None,
                 }
             }
             ctrl = control.recv() => {
@@ -210,7 +217,7 @@ async fn run_typed_loop(
             written = &mut writer_task => {
                 break Some(written.expect("peer writer task panicked"));
             }
-            _ = sleep_until(deadline) => {
+            _ = sleep_until(deadline), if pending.is_none() => {
                 let idle_deadline = traffic.last_active() + PEER_IDLE_TIMEOUT;
                 if idle_deadline <= deadline {
                     break None;
@@ -221,6 +228,9 @@ async fn run_typed_loop(
     };
     reader_task.abort();
     writer_task.abort();
+    if let Some(event) = pending {
+        let _ = events.send(event).await;
+    }
     control.close();
     while let Ok(control) = control.try_recv() {
         if let ConnControl::SendPeer(messages) = control {

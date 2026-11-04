@@ -93,6 +93,10 @@ impl ClientActor {
         self.searches.remove(&token);
     }
 
+    pub(super) fn stop_search_results(&mut self, token: u32) {
+        self.net.disallow(AllowedResponse::Search(token));
+    }
+
     pub(super) fn handle_search_response(&mut self, mut result: SearchResult) {
         let Some(search) = self.searches.get_mut(&result.token) else {
             debug!(
