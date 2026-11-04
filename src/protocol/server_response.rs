@@ -1,16 +1,7 @@
 use std::net::Ipv4Addr;
 
 use super::wire::{MessageReader, ProtocolError};
-use crate::types::{Recommendations, SimilarUser, UserStats};
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct UserData {
-    pub username: String,
-    pub status: u32,
-    pub stats: UserStats,
-    pub slotsfull: u32,
-    pub country: Option<String>,
-}
+use crate::types::{Recommendations, SimilarUser, UserData, UserStats};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoginOutcome {

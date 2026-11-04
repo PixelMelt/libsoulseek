@@ -13,7 +13,7 @@ pub use file::{FileOffset, FileTransferInit};
 pub use peer::{PeerMessage, ResponseHeader};
 pub use peer_init::PeerInitMessage;
 pub use server_request::ServerRequest;
-pub use server_response::{LoginOutcome, ParentCandidate, ServerResponse, UserData};
+pub use server_response::{LoginOutcome, ParentCandidate, ServerResponse};
 pub use wire::{MessageReader, MessageWriter, ProtocolError};
 
 pub const LOGIN_VERSION: u32 = 160;

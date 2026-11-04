@@ -16,4 +16,6 @@ pub use settings::{
     SearchConfig, TransferConfig,
 };
 pub use transfer::{TransferDirection, TransferId, TransferSnapshot, TransferStatus};
-pub use user::{Restriction, SimilarUser, USERNAME_LIMIT, UserStats, UserStatus, ip_matches};
+pub use user::{
+    Restriction, SimilarUser, USERNAME_LIMIT, UserData, UserStats, UserStatus, ip_matches,
+};

@@ -122,10 +122,7 @@ impl ClientActor {
                 self.emit(ClientEvent::RoomList { rooms });
             }
             ServerResponse::JoinRoom { room, users, .. } => {
-                self.emit(ClientEvent::RoomJoined {
-                    room,
-                    users: users.into_iter().map(|user| user.username).collect(),
-                });
+                self.emit(ClientEvent::RoomJoined { room, users });
             }
             ServerResponse::LeaveRoom { room } => {
                 self.emit(ClientEvent::RoomLeft { room });
@@ -133,7 +130,7 @@ impl ClientActor {
             ServerResponse::UserJoinedRoom { room, userdata } => {
                 self.emit(ClientEvent::RoomUserJoined {
                     room,
-                    username: userdata.username,
+                    user: userdata,
                 });
             }
             ServerResponse::UserLeftRoom { room, username } => {
