@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 
 use crate::network::conn::{ConnControl, ConnEvent, SharedAllowed, SharedLimits};
 use crate::network::{NetworkCommand, NetworkEvent};
+use crate::outbox::Outbox;
 use crate::protocol::ServerRequest;
 use crate::types::ConnectionType;
 
@@ -38,7 +39,8 @@ const CONN_CONTROL_QUEUE_CAPACITY: usize = 1024;
 
 pub struct Actor {
     commands: mpsc::Receiver<NetworkCommand>,
-    events: mpsc::Sender<NetworkEvent>,
+    events: Outbox<NetworkEvent>,
+    reported_connections: usize,
     conn_events_tx: mpsc::Sender<ConnEvent>,
     conn_events: mpsc::Receiver<ConnEvent>,
     allowed: SharedAllowed,
@@ -61,7 +63,8 @@ impl Actor {
         let (conn_events_tx, conn_events) = mpsc::channel(CONN_EVENT_QUEUE_CAPACITY);
         Self {
             commands,
-            events,
+            events: Outbox::new(events),
+            reported_connections: 0,
             conn_events_tx,
             conn_events,
             allowed: Arc::default(),
@@ -80,6 +83,7 @@ impl Actor {
         let mut sweep = tokio::time::interval(SWEEP_INTERVAL);
         let mut ping = tokio::time::interval(SERVER_PING_INTERVAL);
         loop {
+            let delivering = self.events.is_empty();
             tokio::select! {
                 command = self.commands.recv() => {
                     match command {
@@ -90,19 +94,21 @@ impl Actor {
                         Some(command) => self.handle_command(command),
                     }
                 }
-                event = self.conn_events.recv() => {
+                event = self.conn_events.recv(), if delivering => {
                     let event =
                         event.expect("conn event channel closed while the actor holds the sender");
                     self.handle_conn_event(event);
                 }
                 accepted = server::accept(&self.server.listener, self.server.accept_resumes_at),
-                    if self.has_free_socket() => {
+                    if delivering && self.has_free_socket() => {
                     self.handle_accept(accepted);
                 }
+                _ = self.events.ready(), if !delivering => self.events.flush(),
                 _ = sweep.tick() => {
                     self.sweep_indirect_requests();
                     self.check_login_timeout();
                     self.check_socket_limit();
+                    self.report_connection_count();
                 }
                 _ = ping.tick() => {
                     if self.server.is_logged_in() {
@@ -113,11 +119,8 @@ impl Actor {
         }
     }
 
-    fn emit(&self, event: NetworkEvent) {
-        match self.events.try_send(event) {
-            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => panic!("network event queue overflowed"),
-        }
+    fn emit(&mut self, event: NetworkEvent) {
+        self.events.send(event);
     }
 
     fn handle_command(&mut self, command: NetworkCommand) {

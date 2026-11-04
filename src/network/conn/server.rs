@@ -52,17 +52,20 @@ pub async fn run_server_conn(
     let (frames_tx, mut frames) = mpsc::channel(FRAME_QUEUE_CAPACITY);
     let reader_task = tokio::spawn(read_server_frames(BufReader::new(read_half), frames_tx));
 
+    let mut pending = None;
     let error = loop {
         tokio::select! {
-            frame = frames.recv() => {
+            frame = frames.recv(), if pending.is_none() => {
                 match frame {
-                    Some(Ok(message)) => {
-                        if events.send(ConnEvent::ServerMessage(message)).await.is_err() {
-                            break None;
-                        }
-                    }
+                    Some(Ok(message)) => pending = Some(ConnEvent::ServerMessage(message)),
                     Some(Err(error)) => break Some(error),
                     None => break Some("connection closed".into()),
+                }
+            }
+            reserved = events.reserve(), if pending.is_some() => {
+                match reserved {
+                    Ok(permit) => permit.send(pending.take().expect("reserved without a pending event")),
+                    Err(_) => break None,
                 }
             }
             ctrl = control.recv() => {
@@ -79,6 +82,9 @@ pub async fn run_server_conn(
         }
     };
     reader_task.abort();
+    if let Some(event) = pending {
+        let _ = events.send(event).await;
+    }
     let _ = events.send(ConnEvent::ServerClosed { error }).await;
 }
 
@@ -117,4 +123,58 @@ async fn read_server_frames(
         }
     };
     let _ = frames.send(Err(error)).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::time::timeout;
+
+    use super::*;
+
+    fn ping() -> Vec<u8> {
+        let mut frame = 4u32.to_le_bytes().to_vec();
+        frame.extend(32u32.to_le_bytes());
+        frame
+    }
+
+    #[tokio::test]
+    async fn writes_continue_while_an_event_waits_for_room() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (events, mut received) = mpsc::channel(1);
+        let (control, control_rx) = mpsc::channel(8);
+        let conn = tokio::spawn(run_server_conn(address, events, control_rx));
+        let (mut server, _) = listener.accept().await.unwrap();
+
+        for _ in 0..3 {
+            server.write_all(&ping()).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        control
+            .send(ConnControl::Send(b"hello".to_vec()))
+            .await
+            .unwrap();
+
+        let mut written = [0u8; 5];
+        timeout(Duration::from_secs(5), server.read_exact(&mut written))
+            .await
+            .expect("the write waited behind the undelivered event")
+            .unwrap();
+        assert_eq!(&written, b"hello");
+
+        for _ in 0..3 {
+            assert!(matches!(
+                received.recv().await,
+                Some(ConnEvent::ServerMessage(ServerResponse::ServerPing))
+            ));
+        }
+        control.send(ConnControl::Close).await.unwrap();
+        assert!(matches!(
+            received.recv().await,
+            Some(ConnEvent::ServerClosed { error: None })
+        ));
+        conn.await.unwrap();
+    }
 }

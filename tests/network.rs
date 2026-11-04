@@ -640,11 +640,17 @@ async fn close_interrupts_a_write_blocked_on_a_peer_that_stopped_reading() {
     let mut alice = connect_stack(server_addr, "alice").await;
     let _stream = raw_peer(&registry, "alice", "mallory").await;
 
-    let conn_id = wait_for(&mut alice.events, |event| match event {
-        NetworkEvent::PeerConnected {
-            username, conn_id, ..
-        } if username == "mallory" => Some(conn_id),
-        _ => None,
+    let mut mallory = None;
+    let mut counted = false;
+    let conn_id = wait_for(&mut alice.events, |event| {
+        match event {
+            NetworkEvent::PeerConnected {
+                username, conn_id, ..
+            } if username == "mallory" => mallory = Some(conn_id),
+            NetworkEvent::ConnectionCount(1) => counted = true,
+            _ => {}
+        }
+        mallory.filter(|_| counted)
     })
     .await;
 
@@ -661,4 +667,30 @@ async fn close_interrupts_a_write_blocked_on_a_peer_that_stopped_reading() {
         _ => None,
     })
     .await;
+}
+
+#[tokio::test]
+async fn a_consumer_that_stops_reading_holds_peers_back_instead_of_crashing() {
+    const FLOOD: usize = 12_000;
+    let (server_addr, registry) = start_fake_server().await;
+    let mut alice = connect_stack(server_addr, "alice").await;
+    let mut stream = raw_peer(&registry, "alice", "mallory").await;
+    let upload = |index: usize| PeerMessage::QueueUpload {
+        file: format!("file {index}"),
+        legacy_client: false,
+    };
+    let flood: Vec<u8> = (0..FLOOD)
+        .flat_map(|index| upload(index).to_bytes())
+        .collect();
+    let writer = tokio::spawn(async move {
+        stream.write_all(&flood).await.unwrap();
+        stream
+    });
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    for index in 0..FLOOD {
+        assert_eq!(next_peer_message(&mut alice.events).await, upload(index));
+    }
+    drop(writer.await.unwrap());
 }

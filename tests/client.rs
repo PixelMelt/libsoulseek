@@ -900,3 +900,40 @@ async fn dropped_browse_retries_do_not_extend_the_coalesce_window() {
     }
     shared_list(&mut frank_events, "eve").await;
 }
+
+#[tokio::test]
+async fn a_consumer_that_stops_reading_holds_search_results_back_instead_of_crashing() {
+    const FLOOD: usize = 10_000;
+    let (server_addr, _registry) = start_fake_server().await;
+    let (responder, _responder_events) = net_peer(server_addr, "ivan").await;
+    let (judy, mut judy_events, _judy_transfers) = login(server_addr, "judy").await;
+    let token = judy.search("song", SearchScope::Global).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let name = |index: usize| format!("Music\\song {index}.mp3");
+    let response = |index: usize| PeerMessage::FileSearchResponse {
+        username: "ivan".into(),
+        token,
+        results: vec![FileInfo {
+            name: name(index),
+            size: 1,
+            attributes: FileAttributes::default(),
+        }],
+        free_upload_slots: true,
+        upload_speed: 1,
+        queue_size: 0,
+        unknown: 0,
+        private_results: Vec::new(),
+    };
+    responder.send(NetworkCommand::SendPeerMessages {
+        username: "judy".into(),
+        messages: (0..FLOOD).map(response).collect(),
+    });
+
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    for index in 0..FLOOD {
+        let (_, results) = search_results(&mut judy_events, token).await;
+        assert_eq!(results[0].name, name(index));
+    }
+}

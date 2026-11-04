@@ -17,7 +17,7 @@ use crate::types::{
 use crate::protocol::PeerMessage;
 
 impl ClientActor {
-    pub(super) fn emit_transfers(&self, work: Vec<TransferWork>) {
+    pub(super) fn emit_transfers(&mut self, work: Vec<TransferWork>) {
         for item in work {
             self.emit_transfer_work(item);
         }

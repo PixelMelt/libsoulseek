@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
-use tokio::time::{Instant, sleep_until};
+use tokio::time::{Instant, MissedTickBehavior, sleep_until};
 use tracing::{info, warn};
 
 use super::transfers::{Downloads, FolderRequests, StorageDone, TransferIds, Uploads};
@@ -22,6 +22,7 @@ use crate::client::{ClientBootstrap, ClientEvent, Observation, ProfileSource, Tr
 use crate::network::{
     AllowedResponse, NetworkCommand, NetworkEvent, NetworkHandle, spawn as spawn_network,
 };
+use crate::outbox::Outbox;
 use crate::protocol::PeerMessage;
 use crate::types::{RuntimeConfig, TransferDirection};
 
@@ -39,8 +40,8 @@ struct ClientActor {
     config: RuntimeConfig,
     profile: Arc<dyn ProfileSource>,
     net: NetworkHandle,
-    events: mpsc::Sender<ClientEvent>,
-    transfers: mpsc::Sender<TransferWork>,
+    events: Outbox<ClientEvent>,
+    transfers: Outbox<TransferWork>,
     token_counter: Arc<AtomicU32>,
     transfer_ids: TransferIds,
     downloads: Downloads,
@@ -68,8 +69,8 @@ async fn run(
 
     let mut actor = ClientActor {
         net: net.clone(),
-        events,
-        transfers,
+        events: Outbox::new(events),
+        transfers: Outbox::new(transfers),
         token_counter,
         transfer_ids: TransferIds::new(&config.transfers),
         downloads: Downloads::new(net.clone(), config.downloads, storage_tx.clone()),
@@ -130,9 +131,12 @@ async fn run(
     }
 
     let mut sweep = tokio::time::interval(SWEEP_INTERVAL);
+    sweep.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         let reconnect_deadline = actor.session.reconnect_at.unwrap_or_else(Instant::now);
         let wish_deadline = actor.wishlist.at.unwrap_or_else(Instant::now);
+        let delivering =
+            actor.events.is_empty() && actor.transfers.is_empty() && !actor.net.is_backlogged();
         tokio::select! {
             command = commands.recv() => {
                 match command {
@@ -143,7 +147,7 @@ async fn run(
                     }
                 }
             }
-            event = net_events.recv() => {
+            event = net_events.recv(), if delivering => {
                 match event {
                     Some(event) => actor.handle_network_event(event),
                     None => {
@@ -152,6 +156,9 @@ async fn run(
                     }
                 }
             }
+            _ = actor.events.ready(), if !actor.events.is_empty() => actor.events.flush(),
+            _ = actor.transfers.ready(), if !actor.transfers.is_empty() => actor.transfers.flush(),
+            _ = actor.net.ready(), if actor.net.is_backlogged() => actor.net.flush(),
             result = scan_rx.recv() => {
                 let (generation, update) =
                     result.expect("scan channel closed while the actor holds the sender");
@@ -161,7 +168,7 @@ async fn run(
                 let done = done.expect("storage channel closed while the actor holds the senders");
                 actor.handle_storage_done(done);
             }
-            _ = sweep.tick() => actor.sweep(),
+            _ = sweep.tick(), if delivering => actor.sweep(),
             _ = sleep_until(reconnect_deadline), if actor.session.reconnect_at.is_some() => {
                 info!("reconnecting to server");
                 actor.connect();
@@ -174,20 +181,12 @@ async fn run(
 }
 
 impl ClientActor {
-    fn emit(&self, event: ClientEvent) {
-        match self.events.try_send(event) {
-            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => panic!("client event queue overflowed"),
-        }
+    fn emit(&mut self, event: ClientEvent) {
+        self.events.send(event);
     }
 
-    fn emit_transfer_work(&self, work: TransferWork) {
-        match self.transfers.try_send(work) {
-            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                panic!("transfer persistence cannot keep up, transfer queue overflowed")
-            }
-        }
+    fn emit_transfer_work(&mut self, work: TransferWork) {
+        self.transfers.send(work);
     }
 
     fn next_token(&self) -> u32 {

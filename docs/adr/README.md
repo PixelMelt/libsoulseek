@@ -14,9 +14,9 @@ Records 0001 to 0028 began in newkitine and were renumbered here. newkitine's in
 | [0002](0002-from-seed-null-failure-reason.md) | TransferPhase::from_seed maps a missing failure reason to an empty reason | Accepted | No counterpart |
 | [0003](0003-share-config-change-invalidates-the-catalog-immediately.md) | Share config change invalidates the catalog immediately | Superseded by ADR 0020 and ADR 0021 | Diverged: Nicotine+ keeps serving the old shares during a rescan |
 | [0004](0004-buddy-only-shares-are-fully-hidden-from-non-buddies.md) | Buddy-only shares are fully hidden from non-buddies | Accepted | Diverges: Nicotine+ sends a locked private section in browses and locked search results |
-| [0005](0005-network-send-sync-client-methods-async.md) | NetworkHandle::send is sync try_send + panic; Client methods are async awaited | Accepted | No counterpart |
+| [0005](0005-network-send-sync-client-methods-async.md) | NetworkHandle::send is sync try_send + panic; Client methods are async awaited | Accepted in part (superseded by ADR 0038 for full queues) | No counterpart |
 | [0006](0006-owner-internal-sibling-imports-do-not-route-through-barrels.md) | Owner-internal sibling imports do not route through barrels | Accepted | No counterpart |
-| [0007](0007-event-emit-panics-on-full-ignores-closed.md) | Event emit() panics on Full, ignores Closed | Accepted | No counterpart |
+| [0007](0007-event-emit-panics-on-full-ignores-closed.md) | Event emit() panics on Full, ignores Closed | Superseded by ADR 0038 | No counterpart |
 | [0008](0008-reconnect-backoff.md) | Reconnect backoff: 5 s base + 0–10 s jitter, doubling to a 300 s cap | Accepted | Matches in shape: Nicotine+ picks a random 5–15 s, then doubles to 300 s |
 | [0009](0009-known-deliberate-protocol-divergences-from-nicotine.md) | Known-deliberate protocol divergences from Nicotine+ | Accepted | Diverges (listed below) |
 | [0010](0010-transfers-are-actor-authoritative.md) | Transfers are actor-authoritative; the consumer's store is a projection of them | Accepted | No counterpart |
@@ -47,3 +47,4 @@ Records 0001 to 0028 began in newkitine and were renumbered here. newkitine's in
 | [0035](0035-a-fast-scan-lists-shares-without-reading-their-files.md) | A fast scan lists shares without reading their files | Accepted (refines ADR 0030) | Diverges: Nicotine+ always reads the audio attributes of new and changed files; `ScanMode::Full` keeps that behaviour |
 | [0036](0036-share-rules-and-download-naming-are-public-so-every-store-applies-the-same-policy.md) | Share rules and download naming are public so every store applies the same policy | Accepted (refines ADR 0030 and ADR 0032) | No counterpart: Nicotine+ has local storage only; the rules themselves are unchanged |
 | [0037](0037-the-network-raises-the-open-file-limit-and-caps-its-sockets.md) | The network raises the open file limit and caps its sockets | Accepted (refines ADR 0011) | Matches the socket cap; diverges in only ever raising the soft file limit |
+| [0038](0038-a-full-queue-between-actors-holds-input-back-instead-of-panicking.md) | A full queue between actors holds input back instead of panicking | Accepted (supersedes ADR 0007, and ADR 0005 in part) | Diverges: Nicotine+ uses an unbounded main-thread queue; the connection count and search result cap match it |

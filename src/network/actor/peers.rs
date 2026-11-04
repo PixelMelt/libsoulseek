@@ -186,7 +186,7 @@ impl Actor {
         }
     }
 
-    pub(super) fn emit_unsent(&self, username: String, unsent: Vec<PeerMessage>) {
+    pub(super) fn emit_unsent(&mut self, username: String, unsent: Vec<PeerMessage>) {
         self.emit(NetworkEvent::PeerConnectionError {
             username,
             unsent,
@@ -226,7 +226,6 @@ impl Actor {
             sends_pushed: 0,
             received_through: 0,
         });
-        self.emit(NetworkEvent::ConnectionCount(self.peers.count()));
         PeerTask {
             conn_id,
             events: self.conn_events_tx.clone(),
@@ -257,6 +256,14 @@ impl Actor {
         self.peers.count()
             + usize::from(self.server.listener.is_some())
             + usize::from(self.server.is_connected())
+    }
+
+    pub(super) fn report_connection_count(&mut self) {
+        let count = self.peers.count();
+        if count != self.reported_connections {
+            self.reported_connections = count;
+            self.emit(NetworkEvent::ConnectionCount(count));
+        }
     }
 
     pub(super) fn has_free_socket(&self) -> bool {
@@ -392,7 +399,6 @@ impl Actor {
         let Some(conn) = self.peers.remove(conn_id) else {
             return;
         };
-        self.emit(NetworkEvent::ConnectionCount(self.peers.count()));
 
         if !conn.established
             && let (Some(token), Some(identity)) = (conn.pierce_token, &conn.identity)
@@ -488,6 +494,25 @@ mod tests {
         assert!(closed(&mut idle));
         assert!(!closed(&mut file));
         assert!(!closed(&mut busy));
+    }
+
+    #[test]
+    fn the_connection_count_is_reported_only_when_it_changes() {
+        let (mut actor, mut events) = actor(8);
+        actor.report_connection_count();
+        let (_conn, _rx) = conn(&mut actor, "peer", ConnectionType::Peer);
+        actor.report_connection_count();
+        actor.report_connection_count();
+        actor.peers.close_all();
+        actor.report_connection_count();
+
+        let counts: Vec<usize> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event {
+                NetworkEvent::ConnectionCount(count) => Some(count),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(counts, vec![1, 0]);
     }
 
     #[test]
